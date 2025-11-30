@@ -1,0 +1,29 @@
+dependencies:
+  chmorgan/esp-libhelix-mp3:
+    component_hash: cbb76089dc2c5749f7b470e2e70aedc44c9da519e04eb9a67d4c7ec275229e53
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.3
+  idf:
+    source:
+      type: idf
+    version: 5.5.1
+  nopnop2002/ssd1306:
+    component_hash: c118e111d989d2b427ff714bab329405d76deff181bd1bb7356b3b19e74c141b
+    dependencies: []
+    source:
+      git: https://github.com/nopnop2002/esp-idf-ssd1306.git
+      path: components/ssd1306/
+      type: git
+    version: 58881eb222d977d99f120d574b705386078a872e
+direct_dependencies:
+- chmorgan/esp-libhelix-mp3
+- nopnop2002/ssd1306
+manifest_hash: b26dea416e05d1c696ee8d5d7a469271de69c5f4c3178c151c1a43658095fd33
+target: esp32c3
+version: 2.0.0

@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/home/thevien257/esp/oled_mp3_player/build/CMakeFiles/bootloader
+/home/thevien257/esp/oled_mp3_player/build/CMakeFiles/bootloader.rule
+/home/thevien257/esp/oled_mp3_player/build/CMakeFiles/bootloader-complete.rule
+/home/thevien257/esp/oled_mp3_player/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/home/thevien257/esp/oled_mp3_player/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/home/thevien257/esp/oled_mp3_player/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/home/thevien257/esp/oled_mp3_player/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/home/thevien257/esp/oled_mp3_player/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/home/thevien257/esp/oled_mp3_player/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/home/thevien257/esp/oled_mp3_player/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule
