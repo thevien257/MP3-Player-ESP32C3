@@ -16,7 +16,6 @@
 #include "mp3dec.h"
 #include "esp_pm.h"
 
-
 // --- VOLUME SETTING (0-100) ---
 #define VOLUME_PERCENT 5
 
@@ -73,7 +72,8 @@ typedef enum
 {
     MODE_PLAYING,
     MODE_MENU,
-    MODE_PLAYLIST
+    MODE_PLAYLIST,
+    MODE_VOLUME
 } MenuMode;
 
 MenuMode currentMode = MODE_PLAYING;
@@ -135,6 +135,7 @@ void show_ready_screen(int track_count);
 void show_playing_screen(void);
 void handle_buttons(void);
 void show_playlist_screen(void);
+void show_volume_screen(void);
 
 bool add_to_playlist(const char *filepath, const char *displayname)
 {
@@ -309,6 +310,10 @@ void display_update_task(void *pvParameters)
             else if (currentMode == MODE_PLAYLIST)
             {
                 show_playlist_screen();
+            }
+            else if (currentMode == MODE_VOLUME)
+            {
+                show_volume_screen();
             }
             last_update = now;
         }
@@ -832,13 +837,18 @@ void handle_buttons(void)
             currentMode = MODE_MENU;
             show_menu_screen();
         }
+        else if (currentMode == MODE_VOLUME)
+        {
+            currentMode = MODE_MENU;
+            show_menu_screen();
+        }
         else
         {
             currentMode = MODE_MENU;
             menuSelection = 0;
             show_menu_screen();
         }
-        return; // Early return for instant response
+        return;
     }
 
     if (is_button_pressed(2))
@@ -855,6 +865,12 @@ void handle_buttons(void)
             playlistScrollOffset = 0;
             lastPlaylistScrollTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
             show_playlist_screen();
+        }
+        else if (currentMode == MODE_VOLUME) // ADD THIS
+        {
+            volumeAnimCurrent = (volumeAnimCurrent + 5) > 100 ? 100 : (volumeAnimCurrent + 5);
+            volumeAnimTarget = volumeAnimCurrent;
+            show_volume_screen();
         }
         else if (currentMode == MODE_PLAYING)
         {
@@ -881,6 +897,12 @@ void handle_buttons(void)
             playlistScrollOffset = 0;
             lastPlaylistScrollTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
             show_playlist_screen();
+        }
+        else if (currentMode == MODE_VOLUME) // ADD THIS
+        {
+            volumeAnimCurrent = (volumeAnimCurrent - 5) < 0 ? 0 : (volumeAnimCurrent - 5);
+            volumeAnimTarget = volumeAnimCurrent;
+            show_volume_screen();
         }
         else if (currentMode == MODE_PLAYING)
         {
@@ -966,15 +988,34 @@ void handle_buttons(void)
                 show_playing_screen();
                 break;
 
-            case 1:
-                stopPlayback = true;
-                isPlaying = false;
-                isPaused = false;
+            case 1: // Stop
+                if (isPlaying || isPaused)
+                {
+                    // Signal playback to stop
+                    stopPlayback = true;
+                    isPlaying = false;
+                    isPaused = false;
+
+                    // Reset playback timing
+                    playbackStartTime = 0;
+                    totalPausedTime = 0;
+                    pauseStartTime = 0;
+
+                    // Reset track info
+                    strcpy(currentTrackName, "Unknown");
+
+                    // Small delay to let playback task stop cleanly
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+
+                // Return to ready screen
                 currentMode = MODE_PLAYING;
                 show_ready_screen(totalTracks);
                 break;
 
-            case 2:
+            case 2: // Volume
+                currentMode = MODE_VOLUME;
+                show_volume_screen();
                 break;
 
             case 3:
@@ -1360,7 +1401,7 @@ void play_file(const char *filename)
 
             // Read new data
             int bytes_read = fread(input_buffer + bytes_in_buffer, 1, bytes_to_read, f);
-            
+
             if (bytes_read == 0)
             {
                 if (bytes_in_buffer == 0)
@@ -1370,7 +1411,7 @@ void play_file(const char *filename)
                 }
                 // Try to process remaining data
             }
-            
+
             bytes_in_buffer += bytes_read;
         }
 
@@ -1378,7 +1419,7 @@ void play_file(const char *filename)
         // STEP 2: FIND SYNC WORD
         // ============================================================
         int offset = MP3FindSyncWord(read_ptr, bytes_in_buffer);
-        
+
         if (offset < 0)
         {
             // No sync found, need more data
@@ -1514,6 +1555,126 @@ void play_file(const char *filename)
     currentAudioFile = NULL;
     currentFileSize = 0;
     currentFilePosition = 0;
+}
+
+void show_volume_screen(void)
+{
+    u8g2_ClearBuffer(&u8g2);
+
+    // ============================================
+    // ULTRA MINIMAL LAYOUT - VERTICAL STACK
+    // Icon → Percentage → Progress Bar
+    // ============================================
+    
+    // ============================================
+    // 1. SPEAKER ICON (TOP CENTER)
+    // ============================================
+    int centerX = 64;
+    int iconY = 16;
+    
+    if (volumeAnimCurrent == 0)
+    {
+        // MUTED - Simple speaker with X
+        // Speaker rectangle
+        u8g2_DrawBox(&u8g2, centerX - 6, iconY, 2, 8);
+        
+        // Speaker cone (filled trapezoid)
+        u8g2_DrawLine(&u8g2, centerX - 4, iconY - 1, centerX + 1, iconY - 3);
+        u8g2_DrawLine(&u8g2, centerX - 4, iconY + 9, centerX + 1, iconY + 11);
+        u8g2_DrawLine(&u8g2, centerX + 1, iconY - 3, centerX + 1, iconY + 11);
+        u8g2_DrawLine(&u8g2, centerX - 4, iconY - 1, centerX - 4, iconY + 9);
+        
+        // Fill cone
+        for (int y = 0; y < 10; y++)
+        {
+            int width = 1 + (y / 2);
+            u8g2_DrawLine(&u8g2, centerX - 4, iconY + y, centerX - 4 + width, iconY + y);
+        }
+        
+        // X mark (bold)
+        u8g2_DrawLine(&u8g2, centerX + 3, iconY - 2, centerX + 10, iconY + 9);
+        u8g2_DrawLine(&u8g2, centerX + 4, iconY - 2, centerX + 11, iconY + 9);
+        u8g2_DrawLine(&u8g2, centerX + 3, iconY + 9, centerX + 10, iconY - 2);
+        u8g2_DrawLine(&u8g2, centerX + 4, iconY + 9, centerX + 11, iconY - 2);
+    }
+    else
+    {
+        // UNMUTED - Speaker with waves
+        // Speaker rectangle
+        u8g2_DrawBox(&u8g2, centerX - 6, iconY, 2, 8);
+        
+        // Speaker cone
+        u8g2_DrawLine(&u8g2, centerX - 4, iconY - 1, centerX + 1, iconY - 3);
+        u8g2_DrawLine(&u8g2, centerX - 4, iconY + 9, centerX + 1, iconY + 11);
+        u8g2_DrawLine(&u8g2, centerX + 1, iconY - 3, centerX + 1, iconY + 11);
+        u8g2_DrawLine(&u8g2, centerX - 4, iconY - 1, centerX - 4, iconY + 9);
+        
+        // Fill cone
+        for (int y = 0; y < 10; y++)
+        {
+            int width = 1 + (y / 2);
+            u8g2_DrawLine(&u8g2, centerX - 4, iconY + y, centerX - 4 + width, iconY + y);
+        }
+        
+        // Sound waves (parentheses style)
+        if (volumeAnimCurrent > 0)
+        {
+            // Small arc
+            u8g2_DrawLine(&u8g2, centerX + 4, iconY + 2, centerX + 4, iconY + 6);
+            u8g2_DrawPixel(&u8g2, centerX + 5, iconY + 1);
+            u8g2_DrawPixel(&u8g2, centerX + 5, iconY + 7);
+        }
+        
+        if (volumeAnimCurrent > 33)
+        {
+            // Medium arc
+            u8g2_DrawLine(&u8g2, centerX + 7, iconY, centerX + 7, iconY + 8);
+            u8g2_DrawPixel(&u8g2, centerX + 8, iconY - 1);
+            u8g2_DrawPixel(&u8g2, centerX + 8, iconY + 9);
+        }
+        
+        if (volumeAnimCurrent > 66)
+        {
+            // Large arc
+            u8g2_DrawLine(&u8g2, centerX + 10, iconY - 2, centerX + 10, iconY + 10);
+            u8g2_DrawPixel(&u8g2, centerX + 11, iconY - 3);
+            u8g2_DrawPixel(&u8g2, centerX + 11, iconY + 11);
+        }
+    }
+
+    // ============================================
+    // 2. VOLUME PERCENTAGE (CENTER)
+    // ============================================
+    u8g2_SetFont(&u8g2, u8g2_font_inb38_mn);  // Extra large font
+    char volText[5];
+    snprintf(volText, sizeof(volText), "%d", volumeAnimCurrent);
+    int volWidth = u8g2_GetStrWidth(&u8g2, volText);
+    
+    u8g2_DrawStr(&u8g2, (128 - volWidth) / 2, 50, volText);
+    
+    // Percent symbol (smaller, aligned)
+    u8g2_SetFont(&u8g2, u8g2_font_helvB12_tr);
+    u8g2_DrawStr(&u8g2, (128 - volWidth) / 2 + volWidth + 3, 47, "%");
+
+    // ============================================
+    // 3. PROGRESS BAR (BOTTOM, FULL WIDTH)
+    // ============================================
+    int barY = 56;
+    int barWidth = 120;  // Almost full width
+    int barHeight = 4;    // Thin and elegant
+    int barX = (128 - barWidth) / 2;
+
+    // Simple rounded frame
+    u8g2_DrawRFrame(&u8g2, barX, barY, barWidth, barHeight, 2);
+    
+    // Filled progress (rounded)
+    int fillWidth = (volumeAnimCurrent * (barWidth - 2)) / 100;
+    if (fillWidth > 0)
+    {
+        u8g2_DrawRBox(&u8g2, barX + 1, barY + 1, fillWidth, barHeight - 2, 1);
+    }
+
+    u8g2_SendBuffer(&u8g2);
 }
 
 void app_main(void)
