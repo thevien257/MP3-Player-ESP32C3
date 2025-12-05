@@ -73,6 +73,7 @@
   "files.associations": {
     "mp3dec.h": "c",
     "string.h": "c",
-    "u8g2.h": "c"
+    "u8g2.h": "c",
+    "typeinfo": "c"
   }
 }

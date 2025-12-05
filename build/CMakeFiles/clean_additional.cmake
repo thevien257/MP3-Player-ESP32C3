@@ -16,9 +16,10 @@ if("${CONFIG}" STREQUAL "" OR "${CONFIG}" STREQUAL "")
   "flasher_args.json"
   "ldgen_libraries"
   "ldgen_libraries.in"
+  "oled_mp3_player.bin"
+  "oled_mp3_player.map"
   "project_elf_src_esp32c3.c"
-  "ssd1306_example.bin"
-  "ssd1306_example.map"
+  "upload.html.S"
   "x509_crt_bundle.S"
   )
 endif()

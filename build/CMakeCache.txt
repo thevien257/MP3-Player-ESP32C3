@@ -213,7 +213,7 @@ CMAKE_PROJECT_DESCRIPTION:STATIC=
 CMAKE_PROJECT_HOMEPAGE_URL:STATIC=
 
 //Value Computed by CMake
-CMAKE_PROJECT_NAME:STATIC=ssd1306_example
+CMAKE_PROJECT_NAME:STATIC=oled_mp3_player
 
 //Value Computed by CMake
 CMAKE_PROJECT_VERSION:STATIC=3.6.4
@@ -355,9 +355,6 @@ PYTHON:UNINITIALIZED=/home/thevien257/.espressif/python_env/idf5.5_py3.12_env/bi
 //No help, variable specified on the command line.
 PYTHON_DEPS_CHECKED:UNINITIALIZED=1
 
-//No help, variable specified on the command line.
-SDKCONFIG:UNINITIALIZED=/home/thevien257/esp/oled_mp3_player/sdkconfig
-
 //Allow unsafe builds. These builds ARE NOT SECURE.
 UNSAFE_BUILD:BOOL=OFF
 
@@ -388,17 +385,17 @@ mbedtls_LIB_DEPENDS:STATIC=general;__idf_cxx;general;__idf_newlib;general;__idf_
 //Dependencies for the target
 mbedx509_LIB_DEPENDS:STATIC=general;__idf_cxx;general;__idf_newlib;general;__idf_freertos;general;__idf_esp_hw_support;general;__idf_heap;general;__idf_log;general;__idf_soc;general;__idf_hal;general;__idf_esp_rom;general;__idf_esp_common;general;__idf_esp_system;general;__idf_riscv;general;mbedcrypto;
 
+//Value Computed by CMake
+oled_mp3_player_BINARY_DIR:STATIC=/home/thevien257/esp/oled_mp3_player/build
+
+//Value Computed by CMake
+oled_mp3_player_IS_TOP_LEVEL:STATIC=ON
+
+//Value Computed by CMake
+oled_mp3_player_SOURCE_DIR:STATIC=/home/thevien257/esp/oled_mp3_player
+
 //Dependencies for the target
 p256m_LIB_DEPENDS:STATIC=general;__idf_cxx;general;__idf_newlib;general;__idf_freertos;general;__idf_esp_hw_support;general;__idf_heap;general;__idf_log;general;__idf_soc;general;__idf_hal;general;__idf_esp_rom;general;__idf_esp_common;general;__idf_esp_system;general;__idf_riscv;
-
-//Value Computed by CMake
-ssd1306_example_BINARY_DIR:STATIC=/home/thevien257/esp/oled_mp3_player/build
-
-//Value Computed by CMake
-ssd1306_example_IS_TOP_LEVEL:STATIC=ON
-
-//Value Computed by CMake
-ssd1306_example_SOURCE_DIR:STATIC=/home/thevien257/esp/oled_mp3_player
 
 
 ########################

@@ -27,4 +27,4 @@ set confirm off
 set confirm on
 
 # Load application symbols
-file /home/thevien257/esp/oled_mp3_player/build/ssd1306_example.elf
+file /home/thevien257/esp/oled_mp3_player/build/oled_mp3_player.elf

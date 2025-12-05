@@ -10,7 +10,7 @@
 /home/thevien257/esp/oled_mp3_player/build/CMakeFiles/flash.dir
 /home/thevien257/esp/oled_mp3_player/build/CMakeFiles/encrypted-flash.dir
 /home/thevien257/esp/oled_mp3_player/build/CMakeFiles/_project_elf_src.dir
-/home/thevien257/esp/oled_mp3_player/build/CMakeFiles/ssd1306_example.elf.dir
+/home/thevien257/esp/oled_mp3_player/build/CMakeFiles/oled_mp3_player.elf.dir
 /home/thevien257/esp/oled_mp3_player/build/CMakeFiles/size.dir
 /home/thevien257/esp/oled_mp3_player/build/CMakeFiles/size-files.dir
 /home/thevien257/esp/oled_mp3_player/build/CMakeFiles/size-components.dir

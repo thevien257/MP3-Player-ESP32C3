@@ -1,0 +1,1154 @@
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ESP32 Music Manager (Sequential)</title>
+    <style>
+      :root {
+        --primary: #6366f1;
+        --success: #22c55e;
+        --danger: #ef4444;
+        --bg: #f8fafc;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+        font-family: system-ui, -apple-system, sans-serif;
+      }
+      body {
+        background: var(--bg);
+        padding: 20px;
+        display: flex;
+        justify-content: center;
+      }
+      .container {
+        width: 100%;
+        max-width: 600px;
+        background: white;
+        border-radius: 16px;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.05);
+        overflow: hidden;
+      }
+      .header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 25px;
+        color: white;
+        text-align: center;
+      }
+      .header h1 {
+        font-size: 24px;
+        margin-bottom: 5px;
+      }
+      .badge {
+        display: inline-block;
+        background: rgba(255, 255, 255, 0.2);
+        padding: 4px 12px;
+        border-radius: 12px;
+        font-size: 12px;
+        margin-top: 8px;
+      }
+      .content {
+        padding: 20px;
+      }
+      .upload-box {
+        border: 2px dashed #cbd5e1;
+        border-radius: 12px;
+        padding: 30px;
+        text-align: center;
+        cursor: pointer;
+        transition: 0.3s;
+        background: #f1f5f9;
+      }
+      .upload-box:hover {
+        border-color: var(--primary);
+        background: #e0e7ff;
+      }
+      .upload-box.disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+        pointer-events: none;
+      }
+      .queue-list {
+        margin-top: 20px;
+        list-style: none;
+      }
+      .queue-item {
+        background: white;
+        border: 1px solid #e2e8f0;
+        padding: 12px;
+        margin-bottom: 8px;
+        border-radius: 8px;
+        transition: all 0.3s ease-out;
+      }
+      .queue-item.uploading {
+        border-left: 4px solid var(--primary);
+        background: #f0f9ff;
+      }
+      .queue-item.completed {
+        border-left: 4px solid var(--success);
+      }
+      .queue-item.waiting {
+        opacity: 0.6;
+      }
+      .progress-bar {
+        height: 4px;
+        background: #e2e8f0;
+        border-radius: 2px;
+        margin-top: 5px;
+        overflow: hidden;
+      }
+      .progress-fill {
+        height: 100%;
+        background: var(--primary);
+        width: 0%;
+        transition: width 0.2s;
+      }
+      .stats {
+        display: flex;
+        gap: 10px;
+        margin-top: 15px;
+      }
+      .stat-box {
+        flex: 1;
+        background: #f1f5f9;
+        padding: 10px;
+        border-radius: 8px;
+        text-align: center;
+      }
+      .stat-value {
+        font-size: 20px;
+        font-weight: 600;
+        color: var(--primary);
+      }
+      .stat-label {
+        font-size: 11px;
+        color: #64748b;
+        margin-top: 4px;
+      }
+      .file-section {
+        margin-top: 30px;
+        border-top: 1px solid #e2e8f0;
+        padding-top: 20px;
+      }
+      .file-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 15px;
+      }
+      .file-header h3 {
+        font-size: 14px;
+      }
+      .select-tools {
+        display: none;
+        gap: 8px;
+      }
+      .select-tools.show {
+        display: flex;
+      }
+      .btn-tool {
+        background: #e2e8f0;
+        color: #475569;
+        padding: 6px 12px;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 12px;
+        transition: 0.2s;
+      }
+      .btn-tool:hover {
+        background: #cbd5e1;
+      }
+      .btn-tool.danger {
+        background: #fee2e2;
+        color: var(--danger);
+      }
+      .btn-tool.danger:hover {
+        background: #fecaca;
+      }
+      .sd-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 12px;
+        border-bottom: 1px solid #f1f5f9;
+        transition: all 0.3s;
+        cursor: pointer;
+      }
+      .sd-item:hover {
+        background: #f8fafc;
+      }
+      .sd-item.selected {
+        background: #dbeafe;
+        border-left: 3px solid var(--primary);
+      }
+      .sd-item.new-file {
+        background: #dcfce7;
+        animation: highlight 1s ease-out;
+      }
+      @keyframes highlight {
+        from {
+          background: #86efac;
+        }
+        to {
+          background: white;
+        }
+      }
+      .sd-item-content {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .checkbox-wrapper {
+        display: flex;
+        align-items: center;
+      }
+      .checkbox-wrapper input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        cursor: pointer;
+      }
+      .file-info {
+        flex: 1;
+      }
+      .file-name {
+        font-weight: 600;
+        display: block;
+      }
+      .file-size {
+        font-size: 12px;
+        color: #64748b;
+      }
+      .btn-del {
+        background: #fee2e2;
+        color: var(--danger);
+        border: none;
+        padding: 6px 12px;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: 0.2s;
+      }
+      .btn-del:hover {
+        background: #fecaca;
+      }
+      .btn-refresh {
+        background: #e2e8f0;
+        color: #475569;
+        width: 100%;
+        padding: 10px;
+        margin-top: 10px;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: 0.2s;
+      }
+      .btn-refresh:hover {
+        background: #cbd5e1;
+      }
+      .info-box {
+        background: #dbeafe;
+        border-left: 3px solid #3b82f6;
+        padding: 12px;
+        margin: 15px 0;
+        border-radius: 6px;
+        font-size: 13px;
+      }
+      .loading-spinner {
+        display: inline-block;
+        width: 14px;
+        height: 14px;
+        border: 2px solid #e2e8f0;
+        border-top-color: var(--primary);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .selection-info {
+        background: #f1f5f9;
+        padding: 8px 12px;
+        border-radius: 6px;
+        font-size: 13px;
+        color: #475569;
+        margin-top: 10px;
+        display: none;
+      }
+      .selection-info.show {
+        display: block;
+      }
+
+      /* Toast Notifications */
+      .toast-container {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        max-width: 400px;
+      }
+      .toast {
+        background: white;
+        padding: 16px 20px;
+        border-radius: 12px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        animation: slideIn 0.3s ease-out;
+        border-left: 4px solid;
+      }
+      .toast.success {
+        border-color: var(--success);
+      }
+      .toast.error {
+        border-color: var(--danger);
+      }
+      .toast.info {
+        border-color: var(--primary);
+      }
+      .toast.warning {
+        border-color: #f59e0b;
+      }
+      .toast-icon {
+        font-size: 24px;
+      }
+      .toast-content {
+        flex: 1;
+      }
+      .toast-title {
+        font-weight: 600;
+        margin-bottom: 2px;
+      }
+      .toast-message {
+        font-size: 13px;
+        color: #64748b;
+      }
+      .toast-close {
+        cursor: pointer;
+        color: #94a3b8;
+        padding: 4px;
+      }
+      @keyframes slideIn {
+        from {
+          transform: translateX(400px);
+          opacity: 0;
+        }
+        to {
+          transform: translateX(0);
+          opacity: 1;
+        }
+      }
+      @keyframes slideOut {
+        from {
+          transform: translateX(0);
+          opacity: 1;
+        }
+        to {
+          transform: translateX(400px);
+          opacity: 0;
+        }
+      }
+
+      /* Modal Confirmation */
+      .modal-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.5);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        z-index: 10000;
+        animation: fadeIn 0.2s;
+      }
+      .modal-overlay.show {
+        display: flex;
+      }
+      .modal {
+        background: white;
+        border-radius: 16px;
+        padding: 24px;
+        max-width: 450px;
+        width: 90%;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        animation: modalIn 0.3s ease-out;
+      }
+      .modal-icon {
+        font-size: 48px;
+        text-align: center;
+        margin-bottom: 16px;
+      }
+      .modal-title {
+        font-size: 20px;
+        font-weight: 600;
+        text-align: center;
+        margin-bottom: 8px;
+      }
+      .modal-message {
+        color: #64748b;
+        text-align: center;
+        margin-bottom: 24px;
+        line-height: 1.5;
+      }
+      .modal-buttons {
+        display: flex;
+        gap: 10px;
+      }
+      .modal-btn {
+        flex: 1;
+        padding: 12px;
+        border: none;
+        border-radius: 8px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: 0.2s;
+      }
+      .modal-btn-cancel {
+        background: #f1f5f9;
+        color: #475569;
+      }
+      .modal-btn-cancel:hover {
+        background: #e2e8f0;
+      }
+      .modal-btn-confirm {
+        background: var(--danger);
+        color: white;
+      }
+      .modal-btn-confirm:hover {
+        background: #dc2626;
+      }
+      .modal-btn-primary {
+        background: var(--primary);
+        color: white;
+      }
+      .modal-btn-primary:hover {
+        background: #4f46e5;
+      }
+      @keyframes fadeIn {
+        from {
+          opacity: 0;
+        }
+        to {
+          opacity: 1;
+        }
+      }
+      @keyframes modalIn {
+        from {
+          transform: scale(0.9);
+          opacity: 0;
+        }
+        to {
+          transform: scale(1);
+          opacity: 1;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <h1>⚡ Music Manager (Sequential)</h1>
+        <p>Upload từng file • Đợi list update • Tự động tiếp tục</p>
+        <div class="badge">Sequential Mode</div>
+      </div>
+
+      <div class="content">
+        <div class="info-box">
+          ✅ <strong>Sequential Upload:</strong> Mỗi file upload xong sẽ đợi
+          list cập nhật trước khi tiếp tục file tiếp theo!
+        </div>
+
+        <div
+          class="upload-box"
+          id="uploadBox"
+          onclick="document.getElementById('fileInput').click()"
+        >
+          <span style="font-size: 40px">☁️</span><br />
+          <strong>Chọn nhiều file MP3</strong>
+          <input
+            type="file"
+            id="fileInput"
+            multiple
+            accept=".mp3"
+            style="display: none"
+            onchange="handleFiles(this.files)"
+          />
+        </div>
+
+        <div class="stats" id="statsBox" style="display: none">
+          <div class="stat-box">
+            <div class="stat-value" id="uploadSpeed">0</div>
+            <div class="stat-label">KB/s</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-value" id="uploadProgress">0%</div>
+            <div class="stat-label">Hoàn thành</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-value" id="queueCount">0</div>
+            <div class="stat-label">Đang chờ</div>
+          </div>
+        </div>
+
+        <div id="queueSection" style="display: none">
+          <h3 style="font-size: 14px; margin: 20px 0 10px">
+            Hàng đợi upload...
+          </h3>
+          <ul class="queue-list" id="queueList"></ul>
+        </div>
+
+        <div class="file-section">
+          <div class="file-header">
+            <h3>📂 File trên thẻ nhớ</h3>
+            <div class="select-tools" id="selectTools">
+              <button class="btn-tool" onclick="selectAll()">
+                ✓ Chọn tất cả
+              </button>
+              <button class="btn-tool" onclick="deselectAll()">
+                ✗ Bỏ chọn
+              </button>
+              <button class="btn-tool danger" onclick="deleteSelected()">
+                🗑️ Xóa đã chọn
+              </button>
+            </div>
+          </div>
+
+          <div class="selection-info" id="selectionInfo">
+            Đã chọn <strong id="selectedCount">0</strong> file
+          </div>
+
+          <div id="sdList">Loading...</div>
+
+          <div style="display: flex; gap: 10px; margin-top: 10px">
+            <button class="btn-refresh" onclick="loadSdFiles()" style="flex: 1">
+              🔄 Làm mới
+            </button>
+            <button
+              class="btn-refresh danger"
+              onclick="deleteAllFiles()"
+              style="flex: 1; background: #fee2e2; color: var(--danger)"
+            >
+              🗑️ Xóa tất cả
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <!-- Modal Confirmation -->
+    <div class="modal-overlay" id="modalOverlay">
+      <div class="modal">
+        <div class="modal-icon" id="modalIcon">⚠️</div>
+        <div class="modal-title" id="modalTitle">Xác nhận</div>
+        <div class="modal-message" id="modalMessage">
+          Bạn có chắc chắn muốn thực hiện hành động này?
+        </div>
+        <div class="modal-buttons">
+          <button class="modal-btn modal-btn-cancel" onclick="closeModal()">
+            Hủy
+          </button>
+          <button class="modal-btn modal-btn-confirm" id="modalConfirm">
+            Xác nhận
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // === Toast Notification System ===
+      function showToast(type, title, message, duration = 4000) {
+        const container = document.getElementById("toastContainer");
+        const toast = document.createElement("div");
+        toast.className = `toast ${type}`;
+
+        const icons = {
+          success: "✅",
+          error: "❌",
+          info: "ℹ️",
+          warning: "⚠️",
+        };
+
+        toast.innerHTML = `
+        <div class="toast-icon">${icons[type] || "ℹ️"}</div>
+        <div class="toast-content">
+          <div class="toast-title">${title}</div>
+          <div class="toast-message">${message}</div>
+        </div>
+        <div class="toast-close" onclick="this.parentElement.remove()">✕</div>
+      `;
+
+        container.appendChild(toast);
+
+        setTimeout(() => {
+          toast.style.animation = "slideOut 0.3s ease-out";
+          setTimeout(() => toast.remove(), 300);
+        }, duration);
+      }
+
+      // === Modal Confirmation System ===
+      let modalResolve = null;
+
+      function showModal(options) {
+        return new Promise((resolve) => {
+          modalResolve = resolve;
+
+          const overlay = document.getElementById("modalOverlay");
+          const icon = document.getElementById("modalIcon");
+          const title = document.getElementById("modalTitle");
+          const message = document.getElementById("modalMessage");
+          const confirmBtn = document.getElementById("modalConfirm");
+
+          icon.textContent = options.icon || "⚠️";
+          title.textContent = options.title || "Xác nhận";
+          message.textContent = options.message || "";
+
+          confirmBtn.textContent = options.confirmText || "Xác nhận";
+          confirmBtn.className = `modal-btn ${
+            options.danger ? "modal-btn-confirm" : "modal-btn-primary"
+          }`;
+
+          overlay.classList.add("show");
+        });
+      }
+
+      function closeModal(result = false) {
+        const overlay = document.getElementById("modalOverlay");
+        overlay.classList.remove("show");
+        if (modalResolve) {
+          modalResolve(result);
+          modalResolve = null;
+        }
+      }
+
+      document.getElementById("modalConfirm").onclick = () => closeModal(true);
+      document.getElementById("modalOverlay").onclick = (e) => {
+        if (e.target.id === "modalOverlay") closeModal(false);
+      };
+
+      // === Original Functions ===
+      function cleanName(str) {
+        let parts = str.split(".");
+        let ext = parts.length > 1 ? parts.pop() : "mp3";
+
+        let name = parts.join(".");
+        name = name
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/đ/g, "d")
+          .replace(/Đ/g, "D")
+          .replace(/\s+/g, "_")
+          .replace(/[^a-zA-Z0-9\._-]/g, "");
+
+        if (name.length > 50) name = name.substring(0, 50);
+        if (name.length === 0) name = "music";
+
+        return name + "." + ext;
+      }
+
+      let uploadQueue = [];
+      let isUploading = false;
+      let totalFiles = 0;
+      let completedFiles = 0;
+      let lastUploadedFileName = null;
+      let selectedFiles = new Set();
+      let allFiles = [];
+
+      function updateSelectionUI() {
+        const count = selectedFiles.size;
+        document.getElementById("selectedCount").textContent = count;
+
+        if (count > 0) {
+          document.getElementById("selectTools").classList.add("show");
+          document.getElementById("selectionInfo").classList.add("show");
+        } else {
+          document.getElementById("selectTools").classList.remove("show");
+          document.getElementById("selectionInfo").classList.remove("show");
+        }
+      }
+
+      function toggleFileSelection(fileName) {
+        if (selectedFiles.has(fileName)) {
+          selectedFiles.delete(fileName);
+        } else {
+          selectedFiles.add(fileName);
+        }
+
+        const checkbox = document.getElementById("cb-" + fileName);
+        if (checkbox) checkbox.checked = selectedFiles.has(fileName);
+
+        const item = document.getElementById("file-" + fileName);
+        if (item) {
+          if (selectedFiles.has(fileName)) {
+            item.classList.add("selected");
+          } else {
+            item.classList.remove("selected");
+          }
+        }
+
+        updateSelectionUI();
+      }
+
+      function selectAll() {
+        selectedFiles.clear();
+        allFiles.forEach((f) => selectedFiles.add(f.name));
+
+        document
+          .querySelectorAll(".file-checkbox")
+          .forEach((cb) => (cb.checked = true));
+        document
+          .querySelectorAll(".sd-item")
+          .forEach((item) => item.classList.add("selected"));
+
+        updateSelectionUI();
+      }
+
+      function deselectAll() {
+        selectedFiles.clear();
+
+        document
+          .querySelectorAll(".file-checkbox")
+          .forEach((cb) => (cb.checked = false));
+        document
+          .querySelectorAll(".sd-item")
+          .forEach((item) => item.classList.remove("selected"));
+
+        updateSelectionUI();
+      }
+
+      async function deleteSelected() {
+        if (selectedFiles.size === 0) {
+          showToast(
+            "warning",
+            "Chưa chọn file",
+            "Vui lòng chọn ít nhất một file để xóa"
+          );
+          return;
+        }
+
+        const confirmed = await showModal({
+          icon: "🗑️",
+          title: "Xóa file đã chọn",
+          message: `Bạn có chắc chắn muốn xóa ${selectedFiles.size} file đã chọn? Hành động này không thể hoàn tác.`,
+          confirmText: "Xóa",
+          danger: true,
+        });
+
+        if (!confirmed) return;
+
+        const filesToDelete = Array.from(selectedFiles);
+        let successCount = 0;
+        let failCount = 0;
+
+        showToast(
+          "info",
+          "Đang xóa...",
+          `Đang xóa ${filesToDelete.length} file`
+        );
+
+        for (const fileName of filesToDelete) {
+          try {
+            const response = await fetch(
+              "/delete?file=" + encodeURIComponent(fileName)
+            );
+            if (response.ok) {
+              successCount++;
+              const item = document.getElementById("file-" + fileName);
+              if (item) {
+                item.style.transition = "all 0.3s ease-out";
+                item.style.opacity = "0";
+                item.style.transform = "translateX(-20px)";
+                await new Promise((resolve) => setTimeout(resolve, 300));
+                item.remove();
+              }
+            } else {
+              failCount++;
+            }
+          } catch (error) {
+            console.error("Delete error:", error);
+            failCount++;
+          }
+        }
+
+        selectedFiles.clear();
+        updateSelectionUI();
+
+        if (failCount > 0) {
+          showToast(
+            "warning",
+            "Xóa hoàn tất",
+            `Thành công: ${successCount}, Thất bại: ${failCount}`
+          );
+        } else {
+          showToast("success", "Xóa thành công", `Đã xóa ${successCount} file`);
+        }
+
+        loadSdFiles();
+      }
+
+      async function deleteAllFiles() {
+        if (allFiles.length === 0) {
+          showToast("warning", "Không có file", "Thẻ nhớ đang trống");
+          return;
+        }
+
+        const confirmed = await showModal({
+          icon: "⚠️",
+          title: "XÓA TẤT CẢ FILE",
+          message: `Bạn sắp xóa TẤT CẢ ${allFiles.length} file trên thẻ nhớ. Hành động này KHÔNG THỂ HOÀN TÁC!`,
+          confirmText: "Xóa tất cả",
+          danger: true,
+        });
+
+        if (!confirmed) return;
+
+        // Double confirmation for delete all
+        const doubleConfirm = await showModal({
+          icon: "🚨",
+          title: "XÁC NHẬN LẦN CUỐI",
+          message: `Bạn có CHẮC CHẮN muốn xóa ${allFiles.length} file? Nhấn "Đồng ý" để tiếp tục.`,
+          confirmText: "Đồng ý, xóa hết",
+          danger: true,
+        });
+
+        if (!doubleConfirm) return;
+
+        let successCount = 0;
+        let failCount = 0;
+
+        showToast(
+          "info",
+          "Đang xóa tất cả...",
+          `Đang xử lý ${allFiles.length} file`,
+          10000
+        );
+
+        for (const file of allFiles) {
+          try {
+            const response = await fetch(
+              "/delete?file=" + encodeURIComponent(file.name)
+            );
+            if (response.ok) {
+              successCount++;
+            } else {
+              failCount++;
+            }
+          } catch (error) {
+            console.error("Delete error:", error);
+            failCount++;
+          }
+        }
+
+        selectedFiles.clear();
+        updateSelectionUI();
+
+        if (failCount > 0) {
+          showToast(
+            "warning",
+            "Xóa hoàn tất",
+            `Thành công: ${successCount}, Thất bại: ${failCount}`
+          );
+        } else {
+          showToast(
+            "success",
+            "Xóa tất cả thành công",
+            `Đã xóa toàn bộ ${successCount} file`
+          );
+        }
+
+        loadSdFiles();
+      }
+
+      function handleFiles(files) {
+        if (isUploading) {
+          showToast(
+            "warning",
+            "Đang upload",
+            "Vui lòng đợi quá trình upload hiện tại hoàn tất"
+          );
+          return;
+        }
+
+        document.getElementById("queueSection").style.display = "block";
+        document.getElementById("statsBox").style.display = "flex";
+        document.getElementById("uploadBox").classList.add("disabled");
+
+        totalFiles = files.length;
+        completedFiles = 0;
+
+        Array.from(files).forEach((file) => {
+          const id = "f-" + Math.random().toString(36).substr(2, 9);
+          const newName = cleanName(file.name);
+          uploadQueue.push({ id, file, newName });
+
+          const li = document.createElement("li");
+          li.className = "queue-item waiting";
+          li.id = id;
+          li.innerHTML = `
+          <div style="display:flex; justify-content:space-between; margin-bottom:5px; align-items:center;">
+            <span style="font-weight:600">🎵 ${newName}</span>
+            <span id="${id}-status" style="font-size:12px; color:#64748b">Chờ...</span>
+          </div>
+          <div class="progress-bar" style="display:none">
+            <div class="progress-fill" id="${id}-bar"></div>
+          </div>
+        `;
+          document.getElementById("queueList").appendChild(li);
+        });
+
+        updateQueueCount();
+        processQueue();
+      }
+
+      function updateQueueCount() {
+        document.getElementById("queueCount").innerText = uploadQueue.length;
+      }
+
+      async function waitForListUpdate(expectedFileName, maxAttempts = 10) {
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          try {
+            const response = await fetch("/list");
+            const files = await response.json();
+
+            const fileExists = files.some((f) => f.name === expectedFileName);
+
+            if (fileExists) {
+              console.log(
+                `✅ File "${expectedFileName}" found in list after ${
+                  attempt + 1
+                } attempts`
+              );
+              displaySdFiles(files, expectedFileName);
+              return true;
+            }
+
+            console.log(
+              `⏳ Attempt ${
+                attempt + 1
+              }/${maxAttempts}: File not in list yet, waiting...`
+            );
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          } catch (error) {
+            console.error("Error checking list:", error);
+          }
+        }
+
+        console.warn(
+          `⚠️ File "${expectedFileName}" not found after ${maxAttempts} attempts`
+        );
+        loadSdFiles();
+        return false;
+      }
+
+      async function processQueue() {
+        if (uploadQueue.length === 0) {
+          isUploading = false;
+          document.getElementById("uploadBox").classList.remove("disabled");
+
+          const queueList = document.getElementById("queueList");
+          if (queueList.children.length === 0) {
+            document.getElementById("statsBox").style.display = "none";
+            document.getElementById("queueSection").style.display = "none";
+          }
+
+          if (completedFiles > 0) {
+            showToast(
+              "success",
+              "Upload hoàn tất",
+              `Đã upload thành công ${completedFiles}/${totalFiles} file`
+            );
+            completedFiles = 0;
+            totalFiles = 0;
+          }
+          return;
+        }
+
+        isUploading = true;
+        const item = uploadQueue.shift();
+        updateQueueCount();
+
+        const ui = document.getElementById(item.id);
+        const status = document.getElementById(item.id + "-status");
+        const bar = document.getElementById(item.id + "-bar");
+
+        ui.classList.remove("waiting");
+        ui.classList.add("uploading");
+        ui.querySelector(".progress-bar").style.display = "block";
+        status.innerHTML = '<span class="loading-spinner"></span> 0%';
+
+        const startTime = Date.now();
+
+        try {
+          await uploadFile(item, status, bar, startTime);
+
+          completedFiles++;
+          ui.classList.remove("uploading");
+          ui.classList.add("completed");
+          status.innerHTML = "✅ Xong";
+          bar.style.backgroundColor = "#22c55e";
+
+          status.innerHTML = "⏳ Đợi list update...";
+          await waitForListUpdate(item.newName);
+
+          ui.style.transition = "all 0.3s ease-out";
+          ui.style.opacity = "0";
+          ui.style.transform = "translateX(20px)";
+
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          ui.remove();
+
+          const queueList = document.getElementById("queueList");
+          if (queueList.children.length === 0) {
+            document.getElementById("queueSection").style.display = "none";
+          }
+
+          await new Promise((resolve) => setTimeout(resolve, 700));
+
+          processQueue();
+        } catch (error) {
+          console.error("Upload error:", error);
+          status.innerText = "❌ Lỗi: " + error.message;
+
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          processQueue();
+        }
+      }
+
+      function uploadFile(item, status, bar, startTime) {
+        return new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+
+          xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable) {
+              const p = Math.round((e.loaded / e.total) * 100);
+              bar.style.width = p + "%";
+              status.innerHTML = `<span class="loading-spinner"></span> ${p}%`;
+
+              const elapsed = (Date.now() - startTime) / 1000;
+              const speed = Math.round(e.loaded / 1024 / elapsed);
+              document.getElementById("uploadSpeed").innerText = speed;
+
+              const totalProgress = Math.round(
+                ((completedFiles + e.loaded / e.total) / totalFiles) * 100
+              );
+              document.getElementById("uploadProgress").innerText =
+                totalProgress + "%";
+            }
+          };
+
+          xhr.onload = () => {
+            if (xhr.status === 200) {
+              resolve();
+            } else {
+              reject(new Error(`HTTP ${xhr.status}`));
+            }
+          };
+
+          xhr.onerror = () => reject(new Error("Network error"));
+          xhr.ontimeout = () => reject(new Error("Timeout"));
+
+          const uploadUrl = "/upload?file=" + encodeURIComponent(item.newName);
+          xhr.open("POST", uploadUrl);
+          xhr.setRequestHeader("Content-Type", "application/octet-stream");
+
+          // === CHANGED: NO TIMEOUT ===
+          xhr.timeout = 0; // 0 = Infinite wait
+
+          console.log("Upload timeout disabled (Infinite wait)");
+
+          xhr.send(item.file);
+        });
+      }
+
+      function displaySdFiles(files, highlightFile = null) {
+        allFiles = files;
+        let html = "";
+
+        if (files.length === 0) {
+          html =
+            '<p style="text-align:center;color:#94a3b8;padding:10px">Thẻ nhớ trống</p>';
+        } else {
+          files.forEach((f) => {
+            const isNew = f.name === highlightFile;
+            const isSelected = selectedFiles.has(f.name);
+            const safeId = f.name.replace(/[^a-zA-Z0-9]/g, "_");
+
+            html += `
+            <div class="sd-item ${isNew ? "new-file" : ""} ${
+              isSelected ? "selected" : ""
+            }" id="file-${f.name}" onclick="toggleFileSelection('${f.name}')">
+              <div class="sd-item-content">
+                <div class="checkbox-wrapper" onclick="event.stopPropagation()">
+                  <input type="checkbox" class="file-checkbox" id="cb-${
+                    f.name
+                  }" 
+                         ${isSelected ? "checked" : ""} 
+                         onchange="toggleFileSelection('${f.name}')">
+                </div>
+                <div class="file-info">
+                  <span class="file-name">${isNew ? "🆕" : "🎵"} ${
+              f.name
+            }</span>
+                  <span class="file-size">${(f.size / 1024 / 1024).toFixed(
+                    2
+                  )} MB</span>
+                </div>
+              </div>
+              <button class="btn-del" onclick="event.stopPropagation(); deleteFile('${
+                f.name
+              }')">🗑️</button>
+            </div>
+          `;
+          });
+        }
+
+        document.getElementById("sdList").innerHTML = html;
+        updateSelectionUI();
+      }
+
+      function loadSdFiles() {
+        fetch("/list")
+          .then((r) => r.json())
+          .then((files) => displaySdFiles(files))
+          .catch((err) => {
+            console.error("Load files error:", err);
+            document.getElementById("sdList").innerHTML =
+              '<p style="text-align:center;color:#ef4444;padding:10px">❌ Lỗi tải danh sách</p>';
+          });
+      }
+
+      function deleteFile(name) {
+        showModal({
+          icon: "🗑️",
+          title: "Xóa file",
+          message: `Bạn có chắc muốn xóa file "${name}"?`,
+          confirmText: "Xóa",
+          danger: true,
+        }).then((confirmed) => {
+          if (confirmed) {
+            fetch("/delete?file=" + encodeURIComponent(name))
+              .then(() => {
+                selectedFiles.delete(name);
+                showToast("success", "Đã xóa", `File "${name}" đã được xóa`);
+                loadSdFiles();
+              })
+              .catch((err) => {
+                showToast("error", "Lỗi xóa file", err.message);
+              });
+          }
+        });
+      }
+
+      loadSdFiles();
+    </script>
+  </body>
+</html>

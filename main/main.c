@@ -2,7 +2,9 @@
 #include <string.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
+#include <sys/param.h>
 #include <dirent.h>
+#include <errno.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -15,6 +17,26 @@
 #include "u8g2_esp32_hal.h"
 #include "mp3dec.h"
 #include "esp_pm.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "esp_http_server.h"
+
+// Add these includes at the top with other includes
+#include "esp_wifi_types.h"
+#include "nvs.h"
+
+// Add these as global variables
+static sdmmc_host_t global_host;
+static sdspi_device_config_t global_slot_config;
+static sdmmc_card_t *global_card = NULL;
+
+static const char *TAG = "MP3_PLAYER";
 
 // --- VOLUME SETTING (0-100) ---
 #define VOLUME_PERCENT 5
@@ -35,12 +57,53 @@
 #define OLED_SDA GPIO_NUM_19
 #define OLED_SCL GPIO_NUM_18
 
+// === WiFi Configuration ===
+#define WIFI_SSID "Ha Tinh"
+#define WIFI_PASS "98764321"
+
+// === CRITICAL OPTIMIZATION: Increase buffer to 64KB ===
+// #define UPLOAD_BUFFER_SIZE (4 * 1024)
+// #define RECEIVE_BUFFER_SIZE (4 * 1024)
+
+// --- DEFINES FOR DYNAMIC SIZES ---
+#define MP3_BUF_SIZE_PLAYING (16 * 1024)
+#define UPLOAD_BUF_SIZE_WIFI (16 * 1024)
+#define RECV_BUF_SIZE_WIFI (16 * 1024)
+
+// Add these defines near WiFi configuration section
+#define DEFAULT_AP_SSID "MP3Player_Config"
+#define DEFAULT_AP_PASS "12345678"
+#define NVS_WIFI_NAMESPACE "wifi_config"
+#define MAX_SSID_LEN 32
+#define MAX_PASS_LEN 64
+
+// Add these global variables
+char stored_ssid[MAX_SSID_LEN] = "";
+char stored_password[MAX_PASS_LEN] = "";
+bool wifi_config_mode = false;
+httpd_handle_t config_server = NULL;
+
+// === STATIC BUFFERS - Tránh fragmentation ===
+uint8_t *input_buffer = NULL;       // Allocated only during playback
+uint8_t *upload_buffer_ptr = NULL;  // Allocated only during WiFi
+uint8_t *receive_buffer_ptr = NULL; // Allocated only during WiFi
+
+static size_t buffer_index = 0;
+static FILE *upload_file = NULL;
+static size_t total_received = 0;
+static int64_t upload_start_time = 0;
+
+httpd_handle_t server = NULL;
+bool isWifiInitialized = false; // To prevent double-init crash
+
+#define MOUNT_POINT "/sdcard"
+
 // --- CRITICAL BUFFER SETTINGS FOR ESP32-C3 SINGLE CORE ---
-#define MP3_INPUT_BUFFER_SIZE (16 * 1024)
+// #define MP3_INPUT_BUFFER_SIZE (8 * 1024)
 #define PCM_FRAME_SAMPLES (MAX_NCHAN * MAX_NGRAN * MAX_NSAMP)
 
 short output_buffer[PCM_FRAME_SAMPLES];
-uint8_t input_buffer[MP3_INPUT_BUFFER_SIZE];
+// uint8_t input_buffer[MP3_INPUT_BUFFER_SIZE];
 
 u8g2_t u8g2;
 i2s_chan_handle_t tx_handle = NULL;
@@ -49,6 +112,7 @@ i2s_chan_handle_t tx_handle = NULL;
 TaskHandle_t playbackTaskHandle = NULL;
 TaskHandle_t displayTaskHandle = NULL;
 volatile bool stopPlayback = false;
+volatile bool isPlayerActive = false; // Flag to tell us if play_file is using memory
 
 FILE *currentAudioFile = NULL;
 size_t currentFileSize = 0;
@@ -78,7 +142,7 @@ typedef enum
 
 MenuMode currentMode = MODE_PLAYING;
 int menuSelection = 0;
-const int menuItems = 5;
+const int menuItems = 7;
 
 typedef enum
 {
@@ -136,6 +200,562 @@ void show_playing_screen(void);
 void handle_buttons(void);
 void show_playlist_screen(void);
 void show_volume_screen(void);
+void show_loading_screen(const char *message);                 // Added
+void show_error_screen(const char *error, const char *detail); // Added
+void show_wifi_info_screen(void);                              // Added
+static httpd_handle_t start_webserver(void);                   // Added
+bool add_to_playlist(const char *filepath, const char *displayname);
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data);
+
+// Add near the top with other helper functions
+static void sync_directory(const char *filepath)
+{
+    // Extract directory path
+    char dirpath[256];
+    strncpy(dirpath, filepath, sizeof(dirpath) - 1);
+    dirpath[sizeof(dirpath) - 1] = '\0';
+
+    char *last_slash = strrchr(dirpath, '/');
+    if (last_slash)
+    {
+        *last_slash = '\0'; // Truncate to get directory path
+
+        // Open and sync the directory
+        DIR *dir = opendir(dirpath);
+        if (dir)
+        {
+            int dir_fd = dirfd(dir);
+            if (dir_fd >= 0)
+            {
+                fsync(dir_fd); // Flush directory metadata
+            }
+            closedir(dir);
+        }
+    }
+}
+
+// WiFi Configuration Storage Functions
+esp_err_t save_wifi_credentials(const char *ssid, const char *password)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        printf("Error opening NVS: %d\n", err);
+        return err;
+    }
+
+    err = nvs_set_str(nvs_handle, "ssid", ssid);
+    if (err != ESP_OK)
+    {
+        nvs_close(nvs_handle);
+        return err;
+    }
+
+    err = nvs_set_str(nvs_handle, "password", password);
+    if (err != ESP_OK)
+    {
+        nvs_close(nvs_handle);
+        return err;
+    }
+
+    err = nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+
+    if (err == ESP_OK)
+    {
+        strncpy(stored_ssid, ssid, MAX_SSID_LEN - 1);
+        strncpy(stored_password, password, MAX_PASS_LEN - 1);
+        printf("WiFi credentials saved: %s\n", ssid);
+    }
+
+    return err;
+}
+
+esp_err_t load_wifi_credentials(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK)
+    {
+        printf("No saved WiFi credentials\n");
+        return err;
+    }
+
+    size_t ssid_len = MAX_SSID_LEN;
+    size_t pass_len = MAX_PASS_LEN;
+
+    err = nvs_get_str(nvs_handle, "ssid", stored_ssid, &ssid_len);
+    if (err == ESP_OK)
+    {
+        err = nvs_get_str(nvs_handle, "password", stored_password, &pass_len);
+    }
+
+    nvs_close(nvs_handle);
+
+    if (err == ESP_OK)
+    {
+        printf("Loaded WiFi credentials: %s\n", stored_ssid);
+    }
+
+    return err;
+}
+
+esp_err_t clear_wifi_credentials(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK)
+        return err;
+
+    nvs_erase_all(nvs_handle);
+    err = nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+
+    memset(stored_ssid, 0, MAX_SSID_LEN);
+    memset(stored_password, 0, MAX_PASS_LEN);
+
+    printf("WiFi credentials cleared\n");
+    return err;
+}
+
+// URL decode helper function
+static void url_decode(char *dst, const char *src)
+{
+    char a, b;
+    while (*src)
+    {
+        if ((*src == '%') &&
+            ((a = src[1]) && (b = src[2])) &&
+            (isxdigit(a) && isxdigit(b)))
+        {
+            if (a >= 'a')
+                a -= 'a' - 'A';
+            if (a >= 'A')
+                a -= ('A' - 10);
+            else
+                a -= '0';
+            if (b >= 'a')
+                b -= 'a' - 'A';
+            if (b >= 'A')
+                b -= ('A' - 10);
+            else
+                b -= '0';
+            *dst++ = 16 * a + b;
+            src += 3;
+        }
+        else if (*src == '+')
+        {
+            *dst++ = ' ';
+            src++;
+        }
+        else
+        {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+}
+
+// HTTP Handlers for WiFi Configuration
+static esp_err_t config_root_handler(httpd_req_t *req)
+{
+    const char *html =
+        "<!DOCTYPE html>"
+        "<html><head>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>MP3 Player WiFi Setup</title>"
+        "<style>"
+        "body{font-family:Arial;margin:0;padding:20px;background:#f0f0f0}"
+        ".container{max-width:400px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}"
+        "h2{color:#333;margin-top:0}"
+        "input{width:100%;padding:10px;margin:8px 0;box-sizing:border-box;border:1px solid #ddd;border-radius:4px}"
+        "button{width:100%;padding:12px;background:#4CAF50;color:white;border:none;border-radius:4px;cursor:pointer;font-size:16px;margin-top:10px}"
+        "button:hover{background:#45a049}"
+        ".info{background:#e7f3ff;padding:10px;border-radius:4px;margin:10px 0;font-size:14px}"
+        ".clear-btn{background:#f44336;margin-top:20px}"
+        ".clear-btn:hover{background:#da190b}"
+        ".status{padding:10px;margin:10px 0;border-radius:4px;display:none}"
+        ".success{background:#d4edda;color:#155724}"
+        ".error{background:#f8d7da;color:#721c24}"
+        "</style>"
+        "</head><body>"
+        "<div class='container'>"
+        "<h2>MP3 Player WiFi Setup</h2>"
+        "<div class='info'>Configure your WiFi credentials to enable music upload</div>"
+        "<form id='wifiForm'>"
+        "<label>WiFi Network Name (SSID):</label>"
+        "<input type='text' id='ssid' name='ssid' placeholder='Enter WiFi SSID' required maxlength='31'>"
+        "<label>WiFi Password:</label>"
+        "<input type='password' id='password' name='password' placeholder='Enter WiFi Password' required maxlength='63'>"
+        "<button type='submit'>Save & Connect</button>"
+        "</form>"
+        "<div id='status' class='status'></div>"
+        "<button class='clear-btn' onclick='clearConfig()'>Clear Saved WiFi</button>"
+        "<div class='info' style='margin-top:20px'>"
+        "After saving, the device will restart and connect to your WiFi network. "
+        "You can then access the upload page at the device's IP address."
+        "</div>"
+        "</div>"
+        "<script>"
+        "document.getElementById('wifiForm').onsubmit = function(e) {"
+        "  e.preventDefault();"
+        "  var ssid = document.getElementById('ssid').value;"
+        "  var pass = document.getElementById('password').value;"
+        "  var status = document.getElementById('status');"
+        "  fetch('/save?ssid=' + encodeURIComponent(ssid) + '&password=' + encodeURIComponent(pass))"
+        "  .then(r => r.text())"
+        "  .then(data => {"
+        "    status.className = 'status success';"
+        "    status.style.display = 'block';"
+        "    status.textContent = 'Saved! Device will restart in 3 seconds...';"
+        "    setTimeout(() => { status.textContent = 'Restarting now...'; }, 3000);"
+        "  })"
+        "  .catch(err => {"
+        "    status.className = 'status error';"
+        "    status.style.display = 'block';"
+        "    status.textContent = 'Error: ' + err;"
+        "  });"
+        "};"
+        "function clearConfig() {"
+        "  if(confirm('Clear saved WiFi credentials?')) {"
+        "    fetch('/clear').then(() => {"
+        "      var status = document.getElementById('status');"
+        "      status.className = 'status success';"
+        "      status.style.display = 'block';"
+        "      status.textContent = 'WiFi credentials cleared! Restarting...';"
+        "      setTimeout(() => location.reload(), 2000);"
+        "    });"
+        "  }"
+        "}"
+        "</script>"
+        "</body></html>";
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html, strlen(html));
+    return ESP_OK;
+}
+
+static esp_err_t config_save_handler(httpd_req_t *req)
+{
+    char buf[200];
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing parameters");
+        return ESP_FAIL;
+    }
+
+    char ssid_encoded[MAX_SSID_LEN] = {0};
+    char password_encoded[MAX_PASS_LEN] = {0};
+    char ssid[MAX_SSID_LEN] = {0};
+    char password[MAX_PASS_LEN] = {0};
+
+    // Get encoded values
+    if (httpd_query_key_value(buf, "ssid", ssid_encoded, sizeof(ssid_encoded)) != ESP_OK ||
+        httpd_query_key_value(buf, "password", password_encoded, sizeof(password_encoded)) != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid parameters");
+        return ESP_FAIL;
+    }
+
+    // Decode URL encoding (e.g., "Ha%20Tinh" -> "Ha Tinh")
+    url_decode(ssid, ssid_encoded);
+    url_decode(password, password_encoded);
+
+    if (strlen(ssid) == 0)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID cannot be empty");
+        return ESP_FAIL;
+    }
+
+    printf("Decoded SSID: %s\n", ssid); // This will now show "Ha Tinh" correctly
+
+    esp_err_t err = save_wifi_credentials(ssid, password);
+    if (err == ESP_OK)
+    {
+        httpd_resp_sendstr(req, "OK");
+        // Schedule restart after 3 seconds
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        esp_restart();
+    }
+    else
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save");
+    }
+
+    return err;
+}
+static esp_err_t config_clear_handler(httpd_req_t *req)
+{
+    esp_err_t err = clear_wifi_credentials();
+    if (err == ESP_OK)
+    {
+        httpd_resp_sendstr(req, "OK");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_restart();
+    }
+    else
+    {
+        httpd_resp_send_500(req);
+    }
+    return err;
+}
+
+// Start WiFi AP Configuration Server
+static httpd_handle_t start_config_webserver(void)
+{
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 4;
+    config.stack_size = 6144;
+
+    if (httpd_start(&server, &config) == ESP_OK)
+    {
+        httpd_uri_t root = {
+            .uri = "/",
+            .method = HTTP_GET,
+            .handler = config_root_handler};
+        httpd_register_uri_handler(server, &root);
+
+        httpd_uri_t save = {
+            .uri = "/save",
+            .method = HTTP_GET,
+            .handler = config_save_handler};
+        httpd_register_uri_handler(server, &save);
+
+        httpd_uri_t clear = {
+            .uri = "/clear",
+            .method = HTTP_GET,
+            .handler = config_clear_handler};
+        httpd_register_uri_handler(server, &clear);
+
+        printf("Config server started\n");
+        return server;
+    }
+
+    return NULL;
+}
+
+// Initialize WiFi in AP mode for configuration
+void start_wifi_config_mode(void)
+{
+    wifi_config_mode = true;
+
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = DEFAULT_AP_SSID,
+            .password = DEFAULT_AP_PASS,
+            .ssid_len = strlen(DEFAULT_AP_SSID),
+            .channel = 1,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .max_connection = 2}};
+
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    esp_wifi_start();
+
+    printf("WiFi AP started: %s\n", DEFAULT_AP_SSID);
+    printf("Password: %s\n", DEFAULT_AP_PASS);
+    printf("Connect and go to: http://192.168.4.1\n");
+}
+
+// Modified wifi_init_sta to use stored credentials
+static void wifi_init_sta_stored(void)
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                        &wifi_event_handler, NULL, &instance_any_id);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                        &wifi_event_handler, NULL, &instance_got_ip);
+
+    wifi_config_t wifi_config = {0};
+    strncpy((char *)wifi_config.sta.ssid, stored_ssid, sizeof(wifi_config.sta.ssid));
+    strncpy((char *)wifi_config.sta.password, stored_password, sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
+    esp_wifi_start();
+
+    esp_netif_set_default_netif(sta_netif);
+}
+
+// === Helper: Xóa playlist cũ để giải phóng RAM ===
+void free_playlist(void)
+{
+    if (playlist != NULL)
+    {
+        free(playlist);
+        playlist = NULL;
+    }
+    playlistSize = 0;
+    playlistCapacity = 0;
+    printf("Playlist cleared.\n");
+}
+
+// === Helper: Quét thẻ nhớ tìm file MP3 ===
+void scan_mp3_files(void)
+{
+    printf("Scanning SD card for MP3 files...\n");
+
+    // Đảm bảo playlist trống trước khi scan
+    free_playlist();
+
+    DIR *dir = opendir("/sdcard");
+    struct dirent *ent;
+
+    if (dir)
+    {
+        while ((ent = readdir(dir)) != NULL)
+        {
+            // Kiểm tra đuôi file .mp3 hoặc .MP3
+            if (strstr(ent->d_name, ".mp3") || strstr(ent->d_name, ".MP3"))
+            {
+                size_t name_len = strlen(ent->d_name);
+                // Giới hạn độ dài tên file để tránh tràn bộ nhớ
+                if (name_len < 240)
+                {
+                    char filepath[256];
+                    snprintf(filepath, sizeof(filepath), "/sdcard/%s", ent->d_name);
+
+                    char displayname[128];
+                    strncpy(displayname, ent->d_name, sizeof(displayname) - 1);
+                    displayname[sizeof(displayname) - 1] = '\0';
+
+                    // Xóa đuôi .mp3 khi hiển thị cho đẹp
+                    char *ext = strstr(displayname, ".mp3");
+                    if (ext)
+                        *ext = '\0';
+                    ext = strstr(displayname, ".MP3");
+                    if (ext)
+                        *ext = '\0';
+
+                    if (!add_to_playlist(filepath, displayname))
+                    {
+                        printf("Playlist full or RAM full!\n");
+                        break;
+                    }
+                }
+            }
+        }
+        closedir(dir);
+    }
+    else
+    {
+        printf("Failed to open directory /sdcard\n");
+    }
+
+    printf("Scan finished. Found %d tracks.\n", playlistSize);
+}
+
+// === WiFi Event Handler ===
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    {
+        esp_wifi_connect();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        esp_wifi_connect();
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+    }
+}
+
+// === Helper: Flush buffer với error handling ===
+static inline esp_err_t flush_buffer_to_sd(FILE *file, const uint8_t *buffer, size_t size)
+{
+    if (size == 0)
+        return ESP_OK;
+
+    size_t aligned_size = (size / 512) * 512;
+    size_t remainder = size % 512;
+
+    if (aligned_size > 0)
+    {
+        size_t written = fwrite(buffer, 1, aligned_size, file);
+        if (written != aligned_size)
+        {
+            return ESP_FAIL;
+        }
+    }
+
+    if (remainder > 0)
+    {
+        size_t written = fwrite(buffer + aligned_size, 1, remainder, file);
+        if (written != remainder)
+        {
+            return ESP_FAIL;
+        }
+    }
+
+    return ESP_OK;
+}
+
+// === Initialize WiFi with Performance Optimizations ===
+static void wifi_init_sta(void)
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    esp_event_handler_instance_register(WIFI_EVENT,
+                                        ESP_EVENT_ANY_ID,
+                                        &wifi_event_handler,
+                                        NULL,
+                                        &instance_any_id);
+    esp_event_handler_instance_register(IP_EVENT,
+                                        IP_EVENT_STA_GOT_IP,
+                                        &wifi_event_handler,
+                                        NULL,
+                                        &instance_got_ip);
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
+    esp_wifi_set_max_tx_power(84);
+
+    esp_wifi_start();
+
+    esp_netif_set_default_netif(sta_netif);
+}
 
 bool add_to_playlist(const char *filepath, const char *displayname)
 {
@@ -294,13 +914,12 @@ void vietnamese_to_ascii(const char *input, char *output, size_t output_size)
 void display_update_task(void *pvParameters)
 {
     uint32_t last_update = 0;
-    const uint32_t DISPLAY_UPDATE_INTERVAL = 150; // Update every 100ms instead of 150ms
+    const uint32_t DISPLAY_UPDATE_INTERVAL = 150;
 
     while (1)
     {
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        // Update display at fixed interval
         if (now - last_update >= DISPLAY_UPDATE_INTERVAL)
         {
             if (currentMode == MODE_PLAYING && isPlaying)
@@ -318,10 +937,9 @@ void display_update_task(void *pvParameters)
             last_update = now;
         }
 
-        // Check buttons more frequently (every 20ms for better responsiveness)
         handle_buttons();
 
-        vTaskDelay(pdMS_TO_TICKS(100)); // Reduced from 50ms to 20ms
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -412,13 +1030,13 @@ void setup_buttons(void)
     gpio_config(&io_conf);
     gpio_isr_handler_add(BTN_DOWN, downISR, NULL);
 
-    io_conf.pin_bit_mask = (1ULL << BTN_LEFT);
-    gpio_config(&io_conf);
-    gpio_isr_handler_add(BTN_LEFT, leftISR, NULL);
+    // io_conf.pin_bit_mask = (1ULL << BTN_LEFT);
+    // gpio_config(&io_conf);
+    // gpio_isr_handler_add(BTN_LEFT, leftISR, NULL);
 
-    io_conf.pin_bit_mask = (1ULL << BTN_RIGHT);
-    gpio_config(&io_conf);
-    gpio_isr_handler_add(BTN_RIGHT, rightISR, NULL);
+    // io_conf.pin_bit_mask = (1ULL << BTN_RIGHT);
+    // gpio_config(&io_conf);
+    // gpio_isr_handler_add(BTN_RIGHT, rightISR, NULL);
 }
 
 bool is_button_pressed(int button_index)
@@ -531,12 +1149,10 @@ void show_playlist_screen(void)
     u8g2_SendBuffer(&u8g2);
 }
 
-// Cache for reducing unnecessary redraws
 static uint32_t last_display_hash = 0;
 
 static inline uint32_t calculate_display_hash(void)
 {
-    // Simple hash to detect if display needs updating
     return (uint32_t)currentTrack ^
            (uint32_t)(currentFilePosition >> 10) ^
            (isPaused ? 0x80000000 : 0) ^
@@ -545,11 +1161,10 @@ static inline uint32_t calculate_display_hash(void)
 
 void show_playing_screen(void)
 {
-    // Skip update if nothing changed (for smoother playback)
     uint32_t new_hash = calculate_display_hash();
     if (new_hash == last_display_hash && !isPaused)
     {
-        return; // Nothing changed, skip redraw
+        return;
     }
     last_display_hash = new_hash;
 
@@ -747,6 +1362,45 @@ void show_playing_screen(void)
     u8g2_SendBuffer(&u8g2);
 }
 
+void show_wifi_info_screen(void)
+{
+    u8g2_ClearBuffer(&u8g2);
+
+    u8g2_SetDrawColor(&u8g2, 1);
+    u8g2_DrawBox(&u8g2, 0, 0, 128, 12);
+    u8g2_SetDrawColor(&u8g2, 0);
+    u8g2_SetFont(&u8g2, u8g2_font_helvB08_tr);
+    const char *headerText = "WiFi Upload";
+    int headerWidth = u8g2_GetStrWidth(&u8g2, headerText);
+    u8g2_DrawStr(&u8g2, (128 - headerWidth) / 2, 10, headerText);
+
+    u8g2_SetDrawColor(&u8g2, 1);
+    u8g2_SetFont(&u8g2, u8g2_font_6x10_tr);
+
+    // Get IP address
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip_info;
+
+    if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0)
+    {
+        char ip_str[20];
+        snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+
+        u8g2_DrawStr(&u8g2, 10, 25, "Open browser:");
+        u8g2_DrawStr(&u8g2, 10, 38, "http://");
+        u8g2_DrawStr(&u8g2, 46, 38, ip_str);
+
+        u8g2_DrawStr(&u8g2, 10, 53, "Then upload MP3");
+    }
+    else
+    {
+        u8g2_DrawStr(&u8g2, 20, 32, "WiFi not");
+        u8g2_DrawStr(&u8g2, 20, 45, "connected!");
+    }
+
+    u8g2_SendBuffer(&u8g2);
+}
+
 void show_menu_screen(void)
 {
     u8g2_ClearBuffer(&u8g2);
@@ -763,11 +1417,24 @@ void show_menu_screen(void)
     u8g2_SetDrawColor(&u8g2, 1);
     u8g2_SetFont(&u8g2, u8g2_font_6x10_tr);
 
-    const char *items[] = {"Play/Pause", "Stop", "Volume", "Playlist", "Auto-Play"};
+    const char *items[] = {"Play/Pause", "Stop", "Volume", "Playlist",
+                           "Auto-Play", "WiFi Upload", "WiFi Config"};
 
-    for (int i = 0; i < menuItems; i++)
+    // Show only 5 items at a time with scrolling
+    int startIdx = (menuSelection > 2) ? menuSelection - 2 : 0;
+    int endIdx = startIdx + 5;
+    if (endIdx > menuItems)
     {
-        int y = 14 + i * 10;
+        endIdx = menuItems;
+        startIdx = endIdx - 5;
+        if (startIdx < 0)
+            startIdx = 0;
+    }
+
+    for (int i = startIdx; i < endIdx; i++)
+    {
+        int displayIdx = i - startIdx;
+        int y = 14 + displayIdx * 10;
 
         if (i == menuSelection)
         {
@@ -785,7 +1452,7 @@ void show_menu_screen(void)
             u8g2_DrawStr(&u8g2, 20, y + 7, items[i]);
         }
 
-        if (i == 4)
+        if (i == 4) // Auto-Play status
         {
             const char *statusText;
             if (autoPlayMode == AUTOPLAY_OFF)
@@ -813,10 +1480,120 @@ void show_menu_screen(void)
     u8g2_SendBuffer(&u8g2);
 }
 
+// === Start WiFi Mode (Free MP3 RAM -> Alloc WiFi RAM) ===
+bool start_wifi_mode(void)
+{
+    // 1. Free MP3 buffer
+    if (input_buffer != NULL)
+    {
+        free(input_buffer);
+        input_buffer = NULL;
+        printf("MEMORY: Freed MP3 Buffer\n");
+    }
+
+    // === NEW: Force garbage collection ===
+    vTaskDelay(pdMS_TO_TICKS(100)); // Let FreeRTOS clean up
+
+    // Print memory status
+    printf("Free heap BEFORE WiFi alloc: %lu bytes\n", esp_get_free_heap_size());
+    printf("Min heap ever: %lu bytes\n", esp_get_minimum_free_heap_size());
+
+    // 2. Try allocating WiFi Buffers
+    upload_buffer_ptr = (uint8_t *)heap_caps_malloc(UPLOAD_BUF_SIZE_WIFI, MALLOC_CAP_8BIT);
+
+    if (upload_buffer_ptr == NULL)
+    {
+        printf("FAILED to alloc upload buffer (%d KB)\n", UPLOAD_BUF_SIZE_WIFI / 1024);
+        printf("Free heap: %lu bytes\n", esp_get_free_heap_size());
+
+        // Restore MP3 buffer
+        input_buffer = (uint8_t *)malloc(MP3_BUF_SIZE_PLAYING);
+        return false;
+    }
+
+    receive_buffer_ptr = (uint8_t *)heap_caps_malloc(RECV_BUF_SIZE_WIFI, MALLOC_CAP_8BIT);
+
+    if (receive_buffer_ptr == NULL)
+    {
+        printf("FAILED to alloc receive buffer (%d KB)\n", RECV_BUF_SIZE_WIFI / 1024);
+        printf("Free heap: %lu bytes\n", esp_get_free_heap_size());
+
+        // Clean up and restore
+        free(upload_buffer_ptr);
+        upload_buffer_ptr = NULL;
+        input_buffer = (uint8_t *)malloc(MP3_BUF_SIZE_PLAYING);
+        return false;
+    }
+
+    printf("SUCCESS: WiFi buffers allocated\n");
+    printf("Free heap AFTER alloc: %lu bytes\n", esp_get_free_heap_size());
+
+    // 4. Initialize WiFi Stack (Only once per boot)
+    if (!isWifiInitialized)
+    {
+        wifi_init_sta_stored(); // Uses stored credentials
+        isWifiInitialized = true;
+    }
+
+    // 5. Connect
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_start();
+    esp_wifi_connect();
+
+    return true;
+}
+
+// === Stop WiFi Mode (Free WiFi RAM -> Alloc MP3 RAM) ===
+void stop_wifi_mode(void)
+{
+    // 1. Stop Web Server
+    if (server)
+    {
+        httpd_stop(server);
+        server = NULL;
+    }
+
+    // 2. Stop WiFi to save internal RAM
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+
+    // 3. Free WiFi Buffers
+    if (upload_buffer_ptr)
+    {
+        free(upload_buffer_ptr);
+        upload_buffer_ptr = NULL;
+    }
+    if (receive_buffer_ptr)
+    {
+        free(receive_buffer_ptr);
+        receive_buffer_ptr = NULL;
+    }
+
+    // 4. Restore MP3 Buffer
+    if (input_buffer == NULL)
+    {
+        input_buffer = (uint8_t *)malloc(MP3_BUF_SIZE_PLAYING);
+        if (input_buffer == NULL)
+        {
+            printf("CRITICAL: Failed to re-alloc MP3 buffer. System Halted.\n");
+            show_error_screen("Memory Error", "Restart Req");
+            while (1)
+                vTaskDelay(100);
+        }
+    }
+    printf("MEMORY: Restored MP3 Buffer\n");
+}
+
 void handle_buttons(void)
 {
-    bool needsImmediateUpdate = false;
-
     // MENU button - Toggle menu
     if (is_button_pressed(0))
     {
@@ -851,6 +1628,7 @@ void handle_buttons(void)
         return;
     }
 
+    // UP button
     if (is_button_pressed(2))
     {
         if (currentMode == MODE_MENU)
@@ -866,7 +1644,7 @@ void handle_buttons(void)
             lastPlaylistScrollTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
             show_playlist_screen();
         }
-        else if (currentMode == MODE_VOLUME) // ADD THIS
+        else if (currentMode == MODE_VOLUME)
         {
             volumeAnimCurrent = (volumeAnimCurrent + 5) > 100 ? 100 : (volumeAnimCurrent + 5);
             volumeAnimTarget = volumeAnimCurrent;
@@ -883,6 +1661,7 @@ void handle_buttons(void)
         }
     }
 
+    // DOWN button
     if (is_button_pressed(3))
     {
         if (currentMode == MODE_MENU)
@@ -898,7 +1677,7 @@ void handle_buttons(void)
             lastPlaylistScrollTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
             show_playlist_screen();
         }
-        else if (currentMode == MODE_VOLUME) // ADD THIS
+        else if (currentMode == MODE_VOLUME)
         {
             volumeAnimCurrent = (volumeAnimCurrent - 5) < 0 ? 0 : (volumeAnimCurrent - 5);
             volumeAnimTarget = volumeAnimCurrent;
@@ -915,6 +1694,7 @@ void handle_buttons(void)
         }
     }
 
+    // LEFT button
     if (is_button_pressed(4))
     {
         if (currentMode == MODE_MENU)
@@ -946,6 +1726,7 @@ void handle_buttons(void)
         }
     }
 
+    // RIGHT button
     if (is_button_pressed(5))
     {
         if (currentMode == MODE_PLAYING)
@@ -960,13 +1741,14 @@ void handle_buttons(void)
         }
     }
 
+    // CENTER button
     if (is_button_pressed(1))
     {
         if (currentMode == MODE_MENU)
         {
             switch (menuSelection)
             {
-            case 0:
+            case 0: // Play/Pause
                 if (isPaused)
                 {
                     isPaused = false;
@@ -991,24 +1773,15 @@ void handle_buttons(void)
             case 1: // Stop
                 if (isPlaying || isPaused)
                 {
-                    // Signal playback to stop
                     stopPlayback = true;
                     isPlaying = false;
                     isPaused = false;
-
-                    // Reset playback timing
                     playbackStartTime = 0;
                     totalPausedTime = 0;
                     pauseStartTime = 0;
-
-                    // Reset track info
                     strcpy(currentTrackName, "Unknown");
-
-                    // Small delay to let playback task stop cleanly
                     vTaskDelay(pdMS_TO_TICKS(100));
                 }
-
-                // Return to ready screen
                 currentMode = MODE_PLAYING;
                 show_ready_screen(totalTracks);
                 break;
@@ -1018,7 +1791,7 @@ void handle_buttons(void)
                 show_volume_screen();
                 break;
 
-            case 3:
+            case 3: // Playlist
                 currentMode = MODE_PLAYLIST;
                 playlistSelection = currentTrack;
                 playlistScrollStartTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -1027,13 +1800,128 @@ void handle_buttons(void)
                 show_playlist_screen();
                 break;
 
-            case 4:
+            case 4: // Auto-Play
                 if (autoPlayMode == AUTOPLAY_OFF)
                     autoPlayMode = AUTOPLAY_ON;
                 else if (autoPlayMode == AUTOPLAY_ON)
                     autoPlayMode = AUTOPLAY_RANDOM;
                 else
                     autoPlayMode = AUTOPLAY_OFF;
+                show_menu_screen();
+                break;
+
+            case 5: // WiFi Upload
+                // 1. Tell player to stop
+                if (isPlaying || currentAudioFile != NULL || isPlayerActive)
+                {
+                    show_loading_screen("Stopping Audio...");
+                    stopPlayback = true;
+                    isPlaying = false;
+                    isPaused = false;
+                    int safety_timeout = 0;
+                    while (isPlayerActive && safety_timeout < 50)
+                    {
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        safety_timeout++;
+                    }
+                }
+
+                show_loading_screen("Starting WiFi...");
+                vTaskDelay(pdMS_TO_TICKS(100));
+
+                if (start_wifi_mode())
+                {
+                    server = start_webserver();
+
+                    if (server)
+                    {
+                        while (1)
+                        {
+                            show_wifi_info_screen();
+                            // Chờ nút Menu để thoát
+                            if (is_button_pressed(BTN_MENU) || gpio_get_level(BTN_MENU) == 0)
+                            {
+                                vTaskDelay(pdMS_TO_TICKS(50));
+                                while (gpio_get_level(BTN_MENU) == 0)
+                                    vTaskDelay(10);
+                                break;
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(200));
+                        }
+                    }
+                    else
+                    {
+                        show_error_screen("Server Error", "Failed Start");
+                        vTaskDelay(pdMS_TO_TICKS(2000));
+                    }
+
+                    // 1. Dừng WiFi và phục hồi bộ nhớ MP3
+                    show_loading_screen("Stopping WiFi...");
+                    stop_wifi_mode();
+
+                    // 2. === CẬP NHẬT PLAYLIST MỚI === (Code mới thêm)
+                    show_loading_screen("Updating Files...");
+                    scan_mp3_files(); // Scan lại thẻ nhớ
+
+                    // 3. Cập nhật biến toàn cục
+                    totalTracks = playlistSize;
+
+                    // Reset bài hát về đầu danh sách để tránh lỗi nếu danh sách thay đổi
+                    currentTrack = 0;
+                    strcpy(currentTrackName, "Updated");
+                }
+                else
+                {
+                    show_error_screen("Memory Full", "Reboot Req");
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                }
+
+                show_menu_screen();
+                break;
+            case 6: // WiFi Config
+                show_loading_screen("WiFi Config Mode");
+
+                if (isPlaying || isPlayerActive)
+                {
+                    stopPlayback = true;
+                    isPlaying = false;
+                    int timeout = 0;
+                    while (isPlayerActive && timeout < 50)
+                    {
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        timeout++;
+                    }
+                }
+
+                if (server)
+                {
+                    httpd_stop(server);
+                    server = NULL;
+                }
+
+                start_wifi_config_mode();
+                config_server = start_config_webserver();
+
+                if (config_server)
+                {
+                    while (1)
+                    {
+                        u8g2_ClearBuffer(&u8g2);
+                        u8g2_SetFont(&u8g2, u8g2_font_6x10_tr);
+                        u8g2_DrawStr(&u8g2, 5, 15, "WiFi Config Mode");
+                        u8g2_DrawStr(&u8g2, 5, 30, "Connect to:");
+                        u8g2_DrawStr(&u8g2, 10, 42, DEFAULT_AP_SSID);
+                        u8g2_DrawStr(&u8g2, 5, 55, "Open: 192.168.4.1");
+                        u8g2_SendBuffer(&u8g2);
+
+                        if (is_button_pressed(0))
+                            break;
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                    }
+
+                    httpd_stop(config_server);
+                    esp_wifi_stop();
+                }
                 show_menu_screen();
                 break;
             }
@@ -1078,7 +1966,6 @@ void handle_buttons(void)
         }
     }
 }
-
 void show_ready_screen(int track_count)
 {
     u8g2_ClearBuffer(&u8g2);
@@ -1191,13 +2078,73 @@ void init_i2s()
     printf("I2S: 8 desc × 1020 frames = %d bytes DMA buffer\n", 8 * 1020 * 4);
 }
 
+// void init_sd()
+// {
+//     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+//         .format_if_mount_failed = false,
+//         .max_files = 5,
+//         .allocation_unit_size = 64 * 1024,
+//         .use_one_fat = false,
+//         .disk_status_check_enable = false};
+
+//     spi_bus_config_t bus_cfg = {
+//         .mosi_io_num = SD_MOSI,
+//         .miso_io_num = SD_MISO,
+//         .sclk_io_num = SD_CLK,
+//         .quadwp_io_num = -1,
+//         .quadhd_io_num = -1,
+//         .max_transfer_sz = (32 * 1024) + 64,
+//         .flags = SPICOMMON_BUSFLAG_MASTER,
+//     };
+
+//     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
+
+//     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+//     host.slot = SPI2_HOST;
+//     host.max_freq_khz = 20000;
+//     host.command_timeout_ms = 20000;
+
+//     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+//     slot_config.gpio_cs = SD_CS;
+//     slot_config.host_id = host.slot;
+
+//     sdmmc_card_t *card;
+//     esp_err_t ret = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot_config, &mount_config, &card);
+
+//     if (ret != ESP_OK)
+//     {
+//         printf("SD mount failed, retrying at 10MHz...\n");
+//         host.max_freq_khz = 10000;
+//         ret = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot_config, &mount_config, &card);
+//         if (ret != ESP_OK)
+//         {
+//             printf("SD mount failed: 0x%x\n", ret);
+//             show_error_screen("SD Mount Fail", "Check Connection");
+//             while (1)
+//                 vTaskDelay(100);
+//         }
+//     }
+
+//     printf("SD: %s, %lluMB @ %dkHz\n", card->cid.name,
+//            ((uint64_t)card->csd.capacity) * card->csd.sector_size / (1024 * 1024),
+//            host.max_freq_khz);
+
+//     global_host = host;
+//     global_slot_config = slot_config;
+//     global_card = card;
+// }
+
 void init_sd()
 {
+    show_loading_screen("Init SD Card");
+    
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false,
+        .format_if_mount_failed = true,  // Enable formatting
         .max_files = 5,
-        .allocation_unit_size = 16 * 1024,
-        .use_one_fat = false};
+        .allocation_unit_size = 64 * 1024,
+        .use_one_fat = false,
+        .disk_status_check_enable = false
+    };
 
     spi_bus_config_t bus_cfg = {
         .mosi_io_num = SD_MOSI,
@@ -1205,41 +2152,96 @@ void init_sd()
         .sclk_io_num = SD_CLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 16384,
+        .max_transfer_sz = (32 * 1024) + 64,
         .flags = SPICOMMON_BUSFLAG_MASTER,
     };
 
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
+    
+    vTaskDelay(pdMS_TO_TICKS(200)); // Longer delay
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = SPI2_HOST;
     host.max_freq_khz = 20000;
-    host.command_timeout_ms = 2000;
+    host.command_timeout_ms = 10000;
 
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot_config.gpio_cs = SD_CS;
     slot_config.host_id = host.slot;
 
-    sdmmc_card_t *card;
-    esp_err_t ret = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot_config, &mount_config, &card);
-
-    if (ret != ESP_OK)
-    {
-        printf("SD mount failed, retrying at 10MHz...\n");
-        host.max_freq_khz = 10000;
-        ret = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot_config, &mount_config, &card);
-        if (ret != ESP_OK)
-        {
-            printf("SD mount failed: 0x%x\n", ret);
-            show_error_screen("SD Mount Fail", "Check Connection");
-            while (1)
-                vTaskDelay(100);
+    sdmmc_card_t *card = NULL;
+    
+    esp_err_t ret = ESP_FAIL;
+    ret = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot_config, &mount_config, &card);
+    
+    if (ret != ESP_OK) {
+        printf("\n===========================================\n");
+        printf("SD Card Mount Failed - Error 0x%x\n", ret);
+        printf("===========================================\n");
+        
+        if (ret == ESP_ERR_NOT_SUPPORTED) {
+            printf("Your SD card does not support SDIO commands.\n");
+            printf("\nPossible Solutions:\n");
+            printf("1. Use a different SD card (SanDisk/Samsung)\n");
+            printf("2. Use a Class 10 or UHS-I card\n");
+            printf("3. Add 10k pull-up resistors on:\n");
+            printf("   - MISO (GPIO %d)\n", SD_MISO);
+            printf("   - MOSI (GPIO %d)\n", SD_MOSI);
+            printf("   - CLK  (GPIO %d)\n", SD_CLK);
+            printf("   - CS   (GPIO %d)\n", SD_CS);
+            printf("4. Try reformatting the card on PC (FAT32)\n");
+            
+            show_error_screen("Incompatible Card", "Use Modern SD");
+        } else {
+            show_error_screen("SD Mount Fail", "Check Wiring");
         }
+        
+        while (1) vTaskDelay(100);
     }
 
-    printf("SD: %s, %lluMB @ %dkHz\n", card->cid.name,
-           ((uint64_t)card->csd.capacity) * card->csd.sector_size / (1024 * 1024),
-           host.max_freq_khz);
+    printf("\n===========================================\n");
+    printf("SD Card Mounted Successfully!\n");
+    printf("Name: %s\n", card->cid.name);
+    printf("Size: %llu MB\n", ((uint64_t)card->csd.capacity) * card->csd.sector_size / (1024 * 1024));
+    printf("Speed: %d kHz\n", host.max_freq_khz);
+    printf("===========================================\n");
+
+    global_host = host;
+    global_slot_config = slot_config;
+    global_card = card;
+}
+
+// Add this function
+void remount_sd_card(void)
+{
+    printf("Remounting SD card to refresh FAT cache...\n");
+    
+    // Unmount
+    esp_vfs_fat_sdcard_unmount(MOUNT_POINT, global_card);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Remount
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 64 * 1024,
+        .use_one_fat = false,
+        .disk_status_check_enable = false
+    };
+
+    sdmmc_card_t *card_new;
+    esp_err_t ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &global_host,
+                                            &global_slot_config, &mount_config, &card_new);
+    
+    if (ret == ESP_OK)
+    {
+        global_card = card_new;
+        printf("SD card remounted successfully\n");
+    }
+    else
+    {
+        printf("SD remount failed: 0x%x\n", ret);
+    }
 }
 
 static inline void apply_volume_fast(int16_t *samples, size_t count)
@@ -1290,24 +2292,114 @@ static inline void apply_volume_fast(int16_t *samples, size_t count)
     }
 }
 
+// Add this helper function
+bool validate_file_clusters(const char *filename)
+{
+    FILE *test_file = fopen(filename, "rb");
+    if (!test_file)
+    {
+        printf("Cannot open file for validation\n");
+        return false;
+    }
+    
+    // Get file size
+    fseek(test_file, 0, SEEK_END);
+    long file_size = ftell(test_file);
+    fseek(test_file, 0, SEEK_SET);
+    
+    printf("Validating file: %s (%ld bytes)\n", filename, file_size);
+    
+    // Try reading at multiple points throughout the file
+    const int test_points = 20;  // ← INCREASED from 10 to 20 for better coverage
+    uint8_t test_buffer[512];
+    bool all_ok = true;
+    
+    for (int i = 0; i < test_points; i++)
+    {
+        // Test at 0%, 5%, 10%, ..., 95%
+        long test_position = (file_size / test_points) * i;
+        
+        if (fseek(test_file, test_position, SEEK_SET) != 0)
+        {
+            printf("  FAIL at position %ld (seek error)\n", test_position);
+            all_ok = false;
+            break;
+        }
+        
+        size_t read_bytes = fread(test_buffer, 1, sizeof(test_buffer), test_file);
+        if (read_bytes != sizeof(test_buffer) && i < test_points - 1)
+        {
+            printf("  FAIL at position %ld (read error: %zu bytes)\n", test_position, read_bytes);
+            all_ok = false;
+            break;
+        }
+        
+        printf("  OK at %ld (%d%%)\n", test_position, (i * 100) / test_points);
+        vTaskDelay(pdMS_TO_TICKS(10)); // Small delay between seeks
+    }
+    
+    // === ADD: Explicitly test the last 1KB of the file ===
+    if (all_ok && file_size > 1024)
+    {
+        printf("  Testing end of file...\n");
+        if (fseek(test_file, file_size - 1024, SEEK_SET) != 0)
+        {
+            printf("  FAIL at end (seek error)\n");
+            all_ok = false;
+        }
+        else
+        {
+            size_t read_bytes = fread(test_buffer, 1, 512, test_file);
+            if (read_bytes != 512)
+            {
+                printf("  FAIL at end (read error: %zu bytes)\n", read_bytes);
+                all_ok = false;
+            }
+            else
+            {
+                printf("  OK at end (100%%)\n");
+            }
+        }
+    }
+    
+    fclose(test_file);
+    printf("Validation %s\n", all_ok ? "PASSED" : "FAILED");
+    return all_ok;
+}
+
 void play_file(const char *filename)
 {
     printf("Playing: %s\n", filename);
 
-    // **CRITICAL FIX: Reset I2S channel before playing new track**
-    i2s_channel_disable(tx_handle);
-    vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to ensure clean stop
+    //     // === ADD: Validate file first ===
+    // if (!validate_file_clusters(filename))
+    // {
+    //     show_error_screen("File Corrupted", "Cluster Chain Bad");
+    //     vTaskDelay(pdMS_TO_TICKS(2000));
+    //     isPlayerActive = false;
+    //     return;
+    // }
 
-    // Reconfigure I2S to default 44100Hz
+    if (input_buffer == NULL)
+    {
+        printf("Error: input_buffer is NULL!\n");
+        return;
+    }
+
+    // === LOCK: Tell system we are using the buffer ===
+    isPlayerActive = true;
+
+    // ... (Keep your existing I2S setup code) ...
+    i2s_channel_disable(tx_handle);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // ... (Keep clock config code) ...
     i2s_std_clk_config_t clk_cfg_reset = I2S_STD_CLK_DEFAULT_CONFIG(44100);
     i2s_channel_reconfig_std_clock(tx_handle, &clk_cfg_reset);
-
-    i2s_std_slot_config_t slot_cfg_reset = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-        I2S_DATA_BIT_WIDTH_16BIT,
-        I2S_SLOT_MODE_STEREO);
+    // ... (Keep slot config code) ...
+    i2s_std_slot_config_t slot_cfg_reset = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
     slot_cfg_reset.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT;
     i2s_channel_reconfig_std_slot(tx_handle, &slot_cfg_reset);
-
     i2s_channel_enable(tx_handle);
 
     FILE *f = fopen(filename, "rb");
@@ -1315,21 +2407,19 @@ void play_file(const char *filename)
     {
         printf("Failed to open: %s\n", filename);
         show_error_screen("Open Failed", "Cannot read file");
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        isPlayerActive = false; // Unlock before returning
         return;
     }
 
-    // Smaller FILE buffer for large files
+    // ... (Keep setvbuf, fseek, variable setups) ...
     setvbuf(f, NULL, _IOFBF, 4096);
-
-    // Store file handle and size globally for progress tracking
     currentAudioFile = f;
     fseek(f, 0, SEEK_END);
     currentFileSize = ftell(f);
     fseek(f, 0, SEEK_SET);
     currentFilePosition = 0;
 
-    // Update track name for UI
+    // ... (Keep track name logic) ...
     if (currentTrack >= 0 && currentTrack < playlistSize)
     {
         strncpy(currentTrackName, playlist[currentTrack].displayname, sizeof(currentTrackName) - 1);
@@ -1340,7 +2430,6 @@ void play_file(const char *filename)
         strcpy(currentTrackName, "Unknown");
     }
 
-    // Set playback state flags
     isPlaying = true;
     isPaused = false;
     stopPlayback = false;
@@ -1355,175 +2444,90 @@ void play_file(const char *filename)
         fclose(f);
         currentAudioFile = NULL;
         isPlaying = false;
+        isPlayerActive = false; // Unlock before returning
         return;
     }
 
     int bytes_in_buffer = 0;
     uint8_t *read_ptr = input_buffer;
-
-    // Track actual bytes processed for progress bar
     size_t total_input_bytes_processed = 0;
-
-    // Sample rate detection flag
     bool sample_rate_configured = false;
-    int current_sample_rate = 44100; // Default assumption
+    int current_sample_rate = 44100;
 
-    printf("Starting playback loop...\n");
-
+    // === MAIN DECODE LOOP ===
     while (1)
     {
-        // Check if playback was stopped
+        // Check stop flag
         if (stopPlayback || !isPlaying)
-        {
             break;
-        }
 
-        // If paused, just wait - don't process audio
         if (isPaused)
         {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
-        // ============================================================
-        // STEP 1: REFILL INPUT BUFFER
-        // ============================================================
-        int bytes_to_read = MP3_INPUT_BUFFER_SIZE - bytes_in_buffer;
-
+        // ... (Keep all your reading and decoding logic exactly the same) ...
+        int bytes_to_read = MP3_BUF_SIZE_PLAYING - bytes_in_buffer;
         if (bytes_to_read > 0)
         {
-            // Move remaining data to start of buffer
             if (bytes_in_buffer > 0 && read_ptr != input_buffer)
             {
                 memmove(input_buffer, read_ptr, bytes_in_buffer);
             }
             read_ptr = input_buffer;
-
-            // Read new data
             int bytes_read = fread(input_buffer + bytes_in_buffer, 1, bytes_to_read, f);
-
-            if (bytes_read == 0)
-            {
-                if (bytes_in_buffer == 0)
-                {
-                    // End of file
-                    break;
-                }
-                // Try to process remaining data
-            }
-
+            if (bytes_read == 0 && bytes_in_buffer == 0)
+                break;
             bytes_in_buffer += bytes_read;
         }
 
-        // ============================================================
-        // STEP 2: FIND SYNC WORD
-        // ============================================================
         int offset = MP3FindSyncWord(read_ptr, bytes_in_buffer);
-
         if (offset < 0)
         {
-            // No sync found, need more data
             bytes_in_buffer = 0;
             continue;
         }
-
         read_ptr += offset;
         bytes_in_buffer -= offset;
 
-        // Save pointer before decode for progress tracking
         uint8_t *ptr_before_decode = read_ptr;
-
-        // ============================================================
-        // STEP 3: DECODE ONE MP3 FRAME
-        // ============================================================
         int err = MP3Decode(hMP3Decoder, &read_ptr, &bytes_in_buffer, output_buffer, 0);
 
         if (err == ERR_MP3_NONE)
         {
-            // Calculate input bytes consumed by this frame
+            // ... (Keep sample rate check, volume, i2s write) ...
             int input_bytes_consumed = read_ptr - ptr_before_decode;
-
-            // Get frame info
             MP3FrameInfo frameInfo;
             MP3GetLastFrameInfo(hMP3Decoder, &frameInfo);
 
-            // **FIX: Configure I2S sample rate on first successful decode**
             if (!sample_rate_configured)
             {
                 current_sample_rate = frameInfo.samprate;
-                printf("Detected sample rate: %d Hz\n", current_sample_rate);
-
-                // Disable I2S channel
                 i2s_channel_disable(tx_handle);
-                vTaskDelay(pdMS_TO_TICKS(10));
-
-                // Reconfigure with correct sample rate
                 i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(current_sample_rate);
-                esp_err_t ret = i2s_channel_reconfig_std_clock(tx_handle, &clk_cfg);
-                if (ret != ESP_OK)
-                {
-                    printf("Failed to reconfigure I2S clock: 0x%x\n", ret);
-                }
-
-                // Reconfigure slot config
-                i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-                    I2S_DATA_BIT_WIDTH_16BIT,
-                    I2S_SLOT_MODE_STEREO);
-                slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT;
-                ret = i2s_channel_reconfig_std_slot(tx_handle, &slot_cfg);
-                if (ret != ESP_OK)
-                {
-                    printf("Failed to reconfigure I2S slot: 0x%x\n", ret);
-                }
-
-                // Re-enable I2S channel
-                ret = i2s_channel_enable(tx_handle);
-                if (ret != ESP_OK)
-                {
-                    printf("Failed to re-enable I2S: 0x%x\n", ret);
-                }
-
+                i2s_channel_reconfig_std_clock(tx_handle, &clk_cfg);
+                i2s_channel_enable(tx_handle);
                 sample_rate_configured = true;
-                printf("I2S reconfigured to %d Hz\n", current_sample_rate);
             }
 
-            // Apply volume with optimized function
             apply_volume_fast(output_buffer, frameInfo.outputSamps);
 
-            // ============================================================
-            // STEP 4: WRITE TO I2S IN CHUNKS
-            // ============================================================
             size_t bytes_to_write = frameInfo.outputSamps * sizeof(short);
             size_t bytes_written = 0;
             uint8_t *write_ptr = (uint8_t *)output_buffer;
 
-            // Process audio in smaller chunks for better responsiveness
             while (bytes_written < bytes_to_write)
             {
-                // Check for stop/pause more frequently
                 if (stopPlayback || !isPlaying || isPaused)
-                {
                     break;
-                }
-
                 size_t chunk_written;
                 size_t chunk_size = bytes_to_write - bytes_written;
                 if (chunk_size > 2048)
                     chunk_size = 2048;
-
-                esp_err_t ret = i2s_channel_write(tx_handle, write_ptr + bytes_written,
-                                                  chunk_size, &chunk_written, portMAX_DELAY);
-
-                if (ret != ESP_OK)
-                {
-                    printf("I2S write error: 0x%x\n", ret);
-                    break;
-                }
-
+                i2s_channel_write(tx_handle, write_ptr + bytes_written, chunk_size, &chunk_written, portMAX_DELAY);
                 bytes_written += chunk_written;
             }
-
-            // Update progress tracking ONLY after successful I2S write
             if (bytes_written == bytes_to_write)
             {
                 total_input_bytes_processed += input_bytes_consumed;
@@ -1532,13 +2536,10 @@ void play_file(const char *filename)
         }
         else if (err == ERR_MP3_INDATA_UNDERFLOW)
         {
-            // Need more data
             continue;
         }
         else
         {
-            // Decode error - skip bad byte and continue
-            // Don't break playback on minor errors
             if (bytes_in_buffer > 0)
             {
                 read_ptr++;
@@ -1547,51 +2548,40 @@ void play_file(const char *filename)
         }
     }
 
+    // === CLEANUP ===
     MP3FreeDecoder(hMP3Decoder);
     fclose(f);
-    printf("Playback finished\n");
-
-    // Clear file tracking
     currentAudioFile = NULL;
     currentFileSize = 0;
     currentFilePosition = 0;
+
+    // === UNLOCK: Tell system we are done with the buffer ===
+    isPlayerActive = false;
+    printf("Playback Loop Finished. Safe to free.\n");
 }
 
 void show_volume_screen(void)
 {
     u8g2_ClearBuffer(&u8g2);
 
-    // ============================================
-    // ULTRA MINIMAL LAYOUT - VERTICAL STACK
-    // Icon → Percentage → Progress Bar
-    // ============================================
-    
-    // ============================================
-    // 1. SPEAKER ICON (TOP CENTER)
-    // ============================================
     int centerX = 64;
     int iconY = 16;
-    
+
     if (volumeAnimCurrent == 0)
     {
-        // MUTED - Simple speaker with X
-        // Speaker rectangle
         u8g2_DrawBox(&u8g2, centerX - 6, iconY, 2, 8);
-        
-        // Speaker cone (filled trapezoid)
+
         u8g2_DrawLine(&u8g2, centerX - 4, iconY - 1, centerX + 1, iconY - 3);
         u8g2_DrawLine(&u8g2, centerX - 4, iconY + 9, centerX + 1, iconY + 11);
         u8g2_DrawLine(&u8g2, centerX + 1, iconY - 3, centerX + 1, iconY + 11);
         u8g2_DrawLine(&u8g2, centerX - 4, iconY - 1, centerX - 4, iconY + 9);
-        
-        // Fill cone
+
         for (int y = 0; y < 10; y++)
         {
             int width = 1 + (y / 2);
             u8g2_DrawLine(&u8g2, centerX - 4, iconY + y, centerX - 4 + width, iconY + y);
         }
-        
-        // X mark (bold)
+
         u8g2_DrawLine(&u8g2, centerX + 3, iconY - 2, centerX + 10, iconY + 9);
         u8g2_DrawLine(&u8g2, centerX + 4, iconY - 2, centerX + 11, iconY + 9);
         u8g2_DrawLine(&u8g2, centerX + 3, iconY + 9, centerX + 10, iconY - 2);
@@ -1599,75 +2589,58 @@ void show_volume_screen(void)
     }
     else
     {
-        // UNMUTED - Speaker with waves
-        // Speaker rectangle
         u8g2_DrawBox(&u8g2, centerX - 6, iconY, 2, 8);
-        
-        // Speaker cone
+
         u8g2_DrawLine(&u8g2, centerX - 4, iconY - 1, centerX + 1, iconY - 3);
         u8g2_DrawLine(&u8g2, centerX - 4, iconY + 9, centerX + 1, iconY + 11);
         u8g2_DrawLine(&u8g2, centerX + 1, iconY - 3, centerX + 1, iconY + 11);
         u8g2_DrawLine(&u8g2, centerX - 4, iconY - 1, centerX - 4, iconY + 9);
-        
-        // Fill cone
+
         for (int y = 0; y < 10; y++)
         {
             int width = 1 + (y / 2);
             u8g2_DrawLine(&u8g2, centerX - 4, iconY + y, centerX - 4 + width, iconY + y);
         }
-        
-        // Sound waves (parentheses style)
+
         if (volumeAnimCurrent > 0)
         {
-            // Small arc
             u8g2_DrawLine(&u8g2, centerX + 4, iconY + 2, centerX + 4, iconY + 6);
             u8g2_DrawPixel(&u8g2, centerX + 5, iconY + 1);
             u8g2_DrawPixel(&u8g2, centerX + 5, iconY + 7);
         }
-        
+
         if (volumeAnimCurrent > 33)
         {
-            // Medium arc
             u8g2_DrawLine(&u8g2, centerX + 7, iconY, centerX + 7, iconY + 8);
             u8g2_DrawPixel(&u8g2, centerX + 8, iconY - 1);
             u8g2_DrawPixel(&u8g2, centerX + 8, iconY + 9);
         }
-        
+
         if (volumeAnimCurrent > 66)
         {
-            // Large arc
             u8g2_DrawLine(&u8g2, centerX + 10, iconY - 2, centerX + 10, iconY + 10);
             u8g2_DrawPixel(&u8g2, centerX + 11, iconY - 3);
             u8g2_DrawPixel(&u8g2, centerX + 11, iconY + 11);
         }
     }
 
-    // ============================================
-    // 2. VOLUME PERCENTAGE (CENTER)
-    // ============================================
-    u8g2_SetFont(&u8g2, u8g2_font_inb38_mn);  // Extra large font
+    u8g2_SetFont(&u8g2, u8g2_font_inb38_mn);
     char volText[5];
     snprintf(volText, sizeof(volText), "%d", volumeAnimCurrent);
     int volWidth = u8g2_GetStrWidth(&u8g2, volText);
-    
+
     u8g2_DrawStr(&u8g2, (128 - volWidth) / 2, 50, volText);
-    
-    // Percent symbol (smaller, aligned)
+
     u8g2_SetFont(&u8g2, u8g2_font_helvB12_tr);
     u8g2_DrawStr(&u8g2, (128 - volWidth) / 2 + volWidth + 3, 47, "%");
 
-    // ============================================
-    // 3. PROGRESS BAR (BOTTOM, FULL WIDTH)
-    // ============================================
     int barY = 56;
-    int barWidth = 120;  // Almost full width
-    int barHeight = 4;    // Thin and elegant
+    int barWidth = 120;
+    int barHeight = 4;
     int barX = (128 - barWidth) / 2;
 
-    // Simple rounded frame
     u8g2_DrawRFrame(&u8g2, barX, barY, barWidth, barHeight, 2);
-    
-    // Filled progress (rounded)
+
     int fillWidth = (volumeAnimCurrent * (barWidth - 2)) / 100;
     if (fillWidth > 0)
     {
@@ -1677,9 +2650,512 @@ void show_volume_screen(void)
     u8g2_SendBuffer(&u8g2);
 }
 
+// === HTTP Handlers ===
+
+static esp_err_t root_handler(httpd_req_t *req)
+{
+    extern const unsigned char upload_html_start[] asm("_binary_upload_html_start");
+    extern const unsigned char upload_html_end[] asm("_binary_upload_html_end");
+    const size_t upload_html_size = (upload_html_end - upload_html_start);
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, (const char *)upload_html_start, upload_html_size);
+    return ESP_OK;
+}
+
+static esp_err_t list_handler(httpd_req_t *req)
+{
+    DIR *dir = opendir(MOUNT_POINT);
+    if (!dir)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to open directory");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr_chunk(req, "[");
+
+    struct dirent *entry;
+    bool first = true;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (entry->d_type == DT_REG)
+        {
+            char path[300];
+            snprintf(path, sizeof(path), "%s/%s", MOUNT_POINT, entry->d_name);
+
+            struct stat st;
+            if (stat(path, &st) == 0)
+            {
+                char json_entry[400];
+                snprintf(json_entry, sizeof(json_entry),
+                         "%s{\"name\":\"%s\",\"size\":%ld}",
+                         first ? "" : ",", entry->d_name, st.st_size);
+                httpd_resp_sendstr_chunk(req, json_entry);
+                first = false;
+            }
+        }
+    }
+    closedir(dir);
+
+    httpd_resp_sendstr_chunk(req, "]");
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
+
+static esp_err_t delete_handler(httpd_req_t *req)
+{
+    char buf[128];
+    int ret = httpd_req_get_url_query_str(req, buf, sizeof(buf));
+    if (ret != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing parameter");
+        return ESP_FAIL;
+    }
+
+    char param[64];
+    if (httpd_query_key_value(buf, "file", param, sizeof(param)) == ESP_OK)
+    {
+        char filepath[200];
+        snprintf(filepath, sizeof(filepath), "%s/%s", MOUNT_POINT, param);
+
+        if (unlink(filepath) == 0)
+        {
+            httpd_resp_sendstr(req, "Deleted");
+        }
+        else
+        {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Delete failed");
+        }
+    }
+    else
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid parameter");
+    }
+    return ESP_OK;
+}
+
+static void sanitize_filename(char *dest, const char *src, size_t max_len)
+{
+    const char *ext = strrchr(src, '.');
+    if (!ext)
+        ext = "";
+
+    size_t j = 0;
+    size_t limit = (max_len > 60) ? 50 : (max_len - 10);
+
+    for (size_t i = 0; src[i] && j < limit; i++)
+    {
+        if (&src[i] == ext)
+            break;
+
+        unsigned char c = (unsigned char)src[i];
+
+        if ((c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_')
+        {
+            dest[j++] = c;
+        }
+        else if (c == ' ')
+        {
+            dest[j++] = '_';
+        }
+    }
+
+    if (j == 0)
+    {
+        dest[j++] = 'm';
+        dest[j++] = 'u';
+        dest[j++] = 's';
+        dest[j++] = 'i';
+        dest[j++] = 'c';
+    }
+
+    strcpy(dest + j, ext);
+}
+
+static esp_err_t upload_handler(httpd_req_t *req)
+{
+    char buf[256];
+    char raw_filename[128] = {0};
+    char filename[128] = {0};
+
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK)
+    {
+        if (httpd_query_key_value(buf, "file", raw_filename, sizeof(raw_filename)) != ESP_OK)
+        {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing filename");
+            return ESP_FAIL;
+        }
+    }
+    else
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing params");
+        return ESP_FAIL;
+    }
+
+    sanitize_filename(filename, raw_filename, sizeof(filename));
+
+    char filepath[260];
+    snprintf(filepath, sizeof(filepath), "%s/%s", MOUNT_POINT, filename);
+
+    unlink(filepath);
+    upload_file = fopen(filepath, "wb");
+    if (!upload_file)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, strerror(errno));
+        return ESP_FAIL;
+    }
+
+    // Optimize file buffer for SD card writing
+    setvbuf(upload_file, NULL, _IONBF, 0);
+
+    size_t remaining = req->content_len;
+    buffer_index = 0;
+    total_received = 0;
+    upload_start_time = esp_timer_get_time();
+    int64_t last_log_time = upload_start_time;
+    int64_t last_yield_time = upload_start_time;
+
+    esp_err_t ret = ESP_OK;
+    bool upload_failed = false;
+
+    while (remaining > 0 && !upload_failed)
+    {
+        // === CHANGED: Use Defined Size for WiFi ===
+        size_t recv_size = MIN(remaining, RECV_BUF_SIZE_WIFI);
+
+        // === CHANGED: Use Pointer receive_buffer_ptr ===
+        int received = httpd_req_recv(req, (char *)receive_buffer_ptr, recv_size);
+
+        if (received <= 0)
+        {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT)
+            {
+                continue;
+            }
+            ret = ESP_FAIL;
+            upload_failed = true;
+            break;
+        }
+
+        size_t bytes_to_copy = received;
+        size_t copied = 0;
+
+        while (copied < bytes_to_copy && !upload_failed)
+        {
+            // === CHANGED: Use Defined Size for WiFi ===
+            size_t space_left = UPLOAD_BUF_SIZE_WIFI - buffer_index;
+            size_t to_copy = MIN(space_left, bytes_to_copy - copied);
+
+            // === CHANGED: Use Pointers ===
+            memcpy(upload_buffer_ptr + buffer_index,
+                   receive_buffer_ptr + copied, to_copy);
+
+            buffer_index += to_copy;
+            copied += to_copy;
+
+            // === CHANGED: Use Defined Size ===
+            if (buffer_index >= UPLOAD_BUF_SIZE_WIFI)
+            {
+                // === CHANGED: Use Pointer ===
+                if (flush_buffer_to_sd(upload_file, upload_buffer_ptr, buffer_index) != ESP_OK)
+                {
+                    ret = ESP_FAIL;
+                    upload_failed = true;
+                    break;
+                }
+                buffer_index = 0;
+            }
+        }
+
+        if (upload_failed)
+        {
+            break;
+        }
+
+        total_received += received;
+        remaining -= received;
+
+        int64_t now = esp_timer_get_time();
+        if (now - last_log_time >= 500000)
+        {
+            last_log_time = now;
+        }
+
+        if (now - last_yield_time >= 100000)
+        {
+            taskYIELD();
+            last_yield_time = now;
+        }
+    }
+
+    // === CHANGED: Flush remaining using Pointer ===
+    if (ret == ESP_OK && buffer_index > 0)
+    {
+        ret = flush_buffer_to_sd(upload_file, upload_buffer_ptr, buffer_index);
+    }
+
+    // === IMPROVED CLEANUP WITH PROPER SYNC ===
+    // === IMPROVED CLEANUP WITH PROPER SYNC ===
+    if (upload_file)
+    {
+        // 1. Flush C library buffers
+        fflush(upload_file);
+
+        // 2. Get file descriptor and sync file data
+        int fd = fileno(upload_file);
+        if (fd >= 0)
+        {
+            // Multiple sync attempts to ensure write
+            for (int i = 0; i < 3; i++)
+            {
+                fsync(fd);
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+        }
+
+        // 3. Close file BEFORE unmounting
+        fclose(upload_file);
+        upload_file = NULL;
+
+        // 4. CRITICAL: Unmount and remount to force filesystem consistency
+        printf("Forcing filesystem sync...\n");
+
+        // Unmount the SD card
+        esp_vfs_fat_sdcard_unmount(MOUNT_POINT, global_card);
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        // Remount the SD card
+        esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+            .format_if_mount_failed = false,
+            .max_files = 5,
+            .allocation_unit_size = 64 * 1024,
+        };
+
+        sdmmc_card_t *card_new;
+        esp_err_t mount_ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &global_host,
+                                                      &global_slot_config, &mount_config, &card_new);
+
+        if (mount_ret != ESP_OK)
+        {
+            printf("Failed to remount SD card!\n");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        printf("File write completed and synced: %s (%zu bytes)\n", filepath, total_received);
+    }
+
+    if (ret == ESP_OK)
+    {
+        httpd_resp_sendstr(req, "OK");
+    }
+    else
+    {
+        httpd_resp_send_500(req);
+    }
+
+    return ret;
+}
+
+// === NEW: Status Handler for Web Interface ===
+static esp_err_t status_handler(httpd_req_t *req)
+{
+    wifi_ap_record_t wifidata;
+    esp_err_t wifi_err = esp_wifi_sta_get_ap_info(&wifidata);
+    int rssi = 0;
+
+    if (wifi_err == ESP_OK)
+    {
+        rssi = wifidata.rssi;
+    }
+
+    // Get SD Card Total/Free space (Optional, adds a bit of delay but useful)
+    FATFS *fs;
+    DWORD fre_clust, free_sect, tot_sect;
+    uint64_t total = 0, free = 0;
+
+    if (f_getfree("0:", &fre_clust, &fs) == FR_OK)
+    {
+        tot_sect = (fs->n_fatent - 2) * fs->csize;
+        free_sect = fre_clust * fs->csize;
+        total = (uint64_t)tot_sect * 512;
+        free = (uint64_t)free_sect * 512;
+    }
+
+    char json_response[256];
+    // Create JSON with Heap, Min Heap, RSSI, and SD Storage
+    snprintf(json_response, sizeof(json_response),
+             "{\"heap\":%lu,\"min_heap\":%lu,\"rssi\":%d,\"sd_total\":%llu,\"sd_free\":%llu}",
+             esp_get_free_heap_size(),
+             esp_get_minimum_free_heap_size(),
+             rssi,
+             total,
+             free);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_response, strlen(json_response));
+    return ESP_OK;
+}
+
+static httpd_handle_t start_webserver(void)
+{
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+
+    config.max_uri_handlers = 8;
+    config.stack_size = 8192;
+    // === CRITICAL FIX FOR LARGE FILES ===
+    // Increase timeouts. SD writing is slow; don't let the connection die.
+    // === CHANGE: Set to 24 Hours (Virtually Infinite) ===
+    config.recv_wait_timeout = 86400; // Increased from 60
+    config.send_wait_timeout = 86400; // Increased from 60
+    config.lru_purge_enable = true;
+    config.max_open_sockets = 3;
+    config.backlog_conn = 2;
+    config.max_resp_headers = 8;
+
+    if (httpd_start(&server, &config) == ESP_OK)
+    {
+        httpd_uri_t root_uri = {
+            .uri = "/",
+            .method = HTTP_GET,
+            .handler = root_handler,
+        };
+        httpd_register_uri_handler(server, &root_uri);
+
+        httpd_uri_t list_uri = {
+            .uri = "/list",
+            .method = HTTP_GET,
+            .handler = list_handler,
+        };
+        httpd_register_uri_handler(server, &list_uri);
+
+        httpd_uri_t delete_uri = {
+            .uri = "/delete",
+            .method = HTTP_GET,
+            .handler = delete_handler,
+        };
+        httpd_register_uri_handler(server, &delete_uri);
+
+        httpd_uri_t upload_uri = {
+            .uri = "/upload",
+            .method = HTTP_POST,
+            .handler = upload_handler,
+        };
+        httpd_register_uri_handler(server, &upload_uri);
+
+        // // === NEW: Register Status Handler ===
+        // httpd_uri_t status_uri = {
+        //     .uri = "/status",
+        //     .method = HTTP_GET,
+        //     .handler = status_handler,
+        // };
+        // httpd_register_uri_handler(server, &status_uri);
+
+        return server;
+    }
+
+    return NULL;
+}
+
+// Add this helper function before app_main()
+void show_heap_info_screen(const char *title, uint32_t free_heap, uint32_t min_heap)
+{
+    u8g2_ClearBuffer(&u8g2);
+
+    // Title bar
+    u8g2_SetDrawColor(&u8g2, 1);
+    u8g2_DrawBox(&u8g2, 0, 0, 128, 12);
+    u8g2_SetDrawColor(&u8g2, 0);
+    u8g2_SetFont(&u8g2, u8g2_font_helvB08_tr);
+    int titleWidth = u8g2_GetStrWidth(&u8g2, title);
+    u8g2_DrawStr(&u8g2, (128 - titleWidth) / 2, 10, title);
+
+    // Content
+    u8g2_SetDrawColor(&u8g2, 1);
+    u8g2_SetFont(&u8g2, u8g2_font_6x10_tr);
+
+    u8g2_DrawStr(&u8g2, 5, 25, "Free Heap:");
+    char free_str[32];
+    snprintf(free_str, sizeof(free_str), "%lu bytes", free_heap);
+    u8g2_DrawStr(&u8g2, 10, 37, free_str);
+
+    // Show in KB as well
+    char free_kb[32];
+    snprintf(free_kb, sizeof(free_kb), "(%lu KB)", free_heap / 1024);
+    u8g2_DrawStr(&u8g2, 10, 47, free_kb);
+
+    u8g2_DrawStr(&u8g2, 5, 58, "Min Heap:");
+    char min_str[32];
+    snprintf(min_str, sizeof(min_str), "%lu bytes", min_heap);
+    u8g2_DrawStr(&u8g2, 10, 70, min_str); // This will be cut off, but visible partially
+
+    u8g2_SendBuffer(&u8g2);
+}
+
+// Alternative: Two-screen version for better readability
+void show_heap_info_detailed(const char *stage, uint32_t free_heap, uint32_t min_heap)
+{
+    // Screen 1: Free Heap
+    u8g2_ClearBuffer(&u8g2);
+    u8g2_SetDrawColor(&u8g2, 1);
+    u8g2_DrawBox(&u8g2, 0, 0, 128, 12);
+    u8g2_SetDrawColor(&u8g2, 0);
+    u8g2_SetFont(&u8g2, u8g2_font_helvB08_tr);
+    u8g2_DrawStr(&u8g2, 20, 10, stage);
+
+    u8g2_SetDrawColor(&u8g2, 1);
+    u8g2_SetFont(&u8g2, u8g2_font_helvB08_tr);
+    u8g2_DrawStr(&u8g2, 10, 28, "Free Heap:");
+
+    u8g2_SetFont(&u8g2, u8g2_font_helvB10_tr);
+    char free_str[32];
+    snprintf(free_str, sizeof(free_str), "%lu", free_heap);
+    u8g2_DrawStr(&u8g2, 20, 43, free_str);
+    u8g2_SetFont(&u8g2, u8g2_font_6x10_tr);
+    u8g2_DrawStr(&u8g2, 85, 43, "bytes");
+
+    char free_kb[32];
+    snprintf(free_kb, sizeof(free_kb), "(%lu KB)", free_heap / 1024);
+    u8g2_DrawStr(&u8g2, 30, 57, free_kb);
+
+    u8g2_SendBuffer(&u8g2);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // Screen 2: Min Heap
+    u8g2_ClearBuffer(&u8g2);
+    u8g2_SetDrawColor(&u8g2, 1);
+    u8g2_DrawBox(&u8g2, 0, 0, 128, 12);
+    u8g2_SetDrawColor(&u8g2, 0);
+    u8g2_SetFont(&u8g2, u8g2_font_helvB08_tr);
+    u8g2_DrawStr(&u8g2, 20, 10, stage);
+
+    u8g2_SetDrawColor(&u8g2, 1);
+    u8g2_SetFont(&u8g2, u8g2_font_helvB08_tr);
+    u8g2_DrawStr(&u8g2, 10, 28, "Min Heap:");
+
+    u8g2_SetFont(&u8g2, u8g2_font_helvB10_tr);
+    char min_str[32];
+    snprintf(min_str, sizeof(min_str), "%lu", min_heap);
+    u8g2_DrawStr(&u8g2, 20, 43, min_str);
+    u8g2_SetFont(&u8g2, u8g2_font_6x10_tr);
+    u8g2_DrawStr(&u8g2, 85, 43, "bytes");
+
+    char min_kb[32];
+    snprintf(min_kb, sizeof(min_kb), "(%lu KB)", min_heap / 1024);
+    u8g2_DrawStr(&u8g2, 30, 57, min_kb);
+
+    u8g2_SendBuffer(&u8g2);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+}
+
 void app_main(void)
 {
-    printf("=== ESP32-C3 MP3 Player with OLED ===\n");
+    printf("=== ESP32-C3 MP3 Player with OLED & WiFi ===\n");
 
 #ifdef CONFIG_PM_ENABLE
     esp_pm_config_t pm_config = {
@@ -1687,13 +3163,18 @@ void app_main(void)
         .min_freq_mhz = 160,
         .light_sleep_enable = false};
     esp_pm_configure(&pm_config);
-    printf("CPU: 160MHz locked\n");
-#else
-    printf("CPU: Running at default speed\n");
 #endif
 
-    setup_buttons();
+    // === ALLOCATE INITIAL MP3 BUFFER ===
+    // We allocate this immediately on boot for music playback
+    input_buffer = (uint8_t *)malloc(MP3_BUF_SIZE_PLAYING);
+    if (input_buffer == NULL)
+    {
+        printf("CRITICAL: Failed to alloc initial MP3 buffer\n");
+        // We can continue, but music won't play until memory is freed or reboot
+    }
 
+    // === Initialize Hardware ===
     u8g2_esp32_hal_t u8g2_hal = U8G2_ESP32_HAL_DEFAULT;
     u8g2_hal.bus.i2c.sda = OLED_SDA;
     u8g2_hal.bus.i2c.scl = OLED_SCL;
@@ -1706,62 +3187,47 @@ void app_main(void)
     u8g2_InitDisplay(&u8g2);
     u8g2_SetPowerSave(&u8g2, 0);
 
-    show_loading_screen("Initializing...");
+    show_loading_screen("Init NVS");
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
 
-    show_loading_screen("Init I2S...");
+    // Load WiFi credentials
+    load_wifi_credentials();
+    if (strlen(stored_ssid) == 0)
+    {
+        strncpy(stored_ssid, WIFI_SSID, MAX_SSID_LEN - 1);
+        strncpy(stored_password, WIFI_PASS, MAX_PASS_LEN - 1);
+    }
+
+    show_loading_screen("Init Buttons");
+    setup_buttons();
+
+    show_loading_screen("Init I2S");
     init_i2s();
 
-    show_loading_screen("Init SD Card...");
+    show_loading_screen("Init SD Card");
     init_sd();
 
-    show_loading_screen("Scanning Files...");
+    // === NOTE: WiFi is NOT initialized here anymore. ===
+    // It is initialized on-demand in handle_buttons case 5.
 
-    DIR *dir = opendir("/sdcard");
-    struct dirent *ent;
-    playlistSize = 0;
-    playlistCapacity = 0;
-    playlist = NULL;
+    // === Scan Files ===
+    show_loading_screen("Scanning Files");
 
-    if (dir)
-    {
-        while ((ent = readdir(dir)) != NULL)
-        {
-            if (strstr(ent->d_name, ".mp3") || strstr(ent->d_name, ".MP3"))
-            {
-                size_t name_len = strlen(ent->d_name);
-                if (name_len < 240)
-                {
-                    char filepath[256];
-                    snprintf(filepath, sizeof(filepath), "/sdcard/%s", ent->d_name);
+    scan_mp3_files(); // Gọi hàm scan chúng ta vừa tạo
 
-                    char displayname[128];
-                    strncpy(displayname, ent->d_name, sizeof(displayname) - 1);
-                    displayname[sizeof(displayname) - 1] = '\0';
-
-                    char *ext = strstr(displayname, ".mp3");
-                    if (ext)
-                        *ext = '\0';
-                    ext = strstr(displayname, ".MP3");
-                    if (ext)
-                        *ext = '\0';
-
-                    if (!add_to_playlist(filepath, displayname))
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-        closedir(dir);
-    }
+    xTaskCreate(display_update_task, "display_task", 8192, NULL, 5, &displayTaskHandle);
 
     if (playlistSize > 0)
     {
         totalTracks = playlistSize;
         currentTrack = 0;
         show_ready_screen(playlistSize);
-
-        xTaskCreate(display_update_task, "display_task", 4096, NULL, 5, &displayTaskHandle);
 
         while (1)
         {
@@ -1781,7 +3247,6 @@ void app_main(void)
                 if (currentTrack >= 0 && currentTrack < playlistSize)
                 {
                     stopPlayback = false;
-
                     play_file(playlist[currentTrack].filepath);
 
                     if (changeTrack)
@@ -1796,17 +3261,25 @@ void app_main(void)
                         if (autoPlayMode == AUTOPLAY_ON)
                         {
                             if (currentTrack < playlistSize - 1)
-                            {
                                 currentTrack++;
-                            }
                             else
-                            {
                                 currentTrack = 0;
-                            }
                         }
                         else if (autoPlayMode == AUTOPLAY_RANDOM)
                         {
-                            currentTrack = rand() % playlistSize;
+                            int tempTrack = currentTrack;
+                            currentTrack = esp_random() % playlistSize;
+                            while (tempTrack == currentTrack)
+                            {
+                                currentTrack = esp_random() % playlistSize;
+                            }
+                        }
+                        else
+                        {
+                            isPlaying = false;
+                            isPaused = false;
+                            strcpy(currentTrackName, "Unknown");
+                            show_ready_screen(playlistSize);
                         }
                     }
                     else
@@ -1823,7 +3296,6 @@ void app_main(void)
                     show_ready_screen(playlistSize);
                 }
             }
-
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }

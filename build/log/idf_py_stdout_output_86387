@@ -1,0 +1,62 @@
+Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=/home/thevien257/.espressif/python_env/idf5.5_py3.12_env/bin/python -DESP_PLATFORM=1 -DCCACHE_ENABLE=0 /home/thevien257/esp/oled_mp3_player
+-- Found Git: /usr/bin/git (found version "2.43.0")
+-- git rev-parse returned 'fatal: not a git repository (or any parent up to mount point /)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).'
+-- Minimal build - OFF
+-- The C compiler identification is GNU 14.2.0
+-- The CXX compiler identification is GNU 14.2.0
+-- The ASM compiler identification is GNU
+-- Found assembler: /home/thevien257/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20241119/riscv32-esp-elf/bin/riscv32-esp-elf-gcc
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /home/thevien257/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20241119/riscv32-esp-elf/bin/riscv32-esp-elf-gcc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /home/thevien257/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20241119/riscv32-esp-elf/bin/riscv32-esp-elf-g++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Building ESP-IDF components for target esp32c3
+NOTICE: 
+Following dependencies have new versions available:
+Dependency "nopnop2002/ssd1306": "58881eb222d977d99f120d574b705386078a872e" -> "3043b5d7ea97e98598924248c333c61bd5776e66"
+Consider running "idf.py update-dependencies" to update your lock file.
+NOTICE: Processing 3 dependencies:
+NOTICE: [1/3] chmorgan/esp-libhelix-mp3 (1.0.3)
+NOTICE: [2/3] nopnop2002/ssd1306 (58881eb222d977d99f120d574b705386078a872e)
+NOTICE: [3/3] idf (5.5.1)
+-- Project sdkconfig file /home/thevien257/esp/oled_mp3_player/sdkconfig
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/riscv/ld/rom.api.ld
+-- Found Python3: /home/thevien257/.espressif/python_env/idf5.5_py3.12_env/bin/python (found version "3.12.3") found components: Interpreter
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Performing Test C_COMPILER_SUPPORTS_WFORMAT_SIGNEDNESS
+-- Performing Test C_COMPILER_SUPPORTS_WFORMAT_SIGNEDNESS - Success
+-- USING O3
+-- App "oled_mp3_player" version: 8b3c0ff-dirty
+-- Adding linker script /home/thevien257/esp/oled_mp3_player/build/esp-idf/esp_system/ld/memory.ld
+-- Adding linker script /home/thevien257/esp/oled_mp3_player/build/esp-idf/esp_system/ld/sections.ld.in
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.api.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.bt_funcs.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.libgcc.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.version.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.ble_master.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.ble_50.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.ble_smp.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.ble_dtm.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.ble_test.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.ble_scan.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.eco3.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.eco3_bt_funcs.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.libc.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom/esp32c3/ld/esp32c3.rom.newlib.ld
+-- Adding linker script /home/thevien257/esp/v5.5.1/esp-idf/components/soc/esp32c3/ld/esp32c3.peripherals.ld
+-- Components: app_trace app_update bootloader bootloader_support bt chmorgan__esp-libhelix-mp3 cmock console cxx driver efuse esp-tls esp_adc esp_app_format esp_bootloader_format esp_coex esp_common esp_driver_ana_cmpr esp_driver_bitscrambler esp_driver_cam esp_driver_dac esp_driver_gpio esp_driver_gptimer esp_driver_i2c esp_driver_i2s esp_driver_isp esp_driver_jpeg esp_driver_ledc esp_driver_mcpwm esp_driver_parlio esp_driver_pcnt esp_driver_ppa esp_driver_rmt esp_driver_sdio esp_driver_sdm esp_driver_sdmmc esp_driver_sdspi esp_driver_spi esp_driver_touch_sens esp_driver_tsens esp_driver_twai esp_driver_uart esp_driver_usb_serial_jtag esp_eth esp_event esp_gdbstub esp_hid esp_http_client esp_http_server esp_https_ota esp_https_server esp_hw_support esp_lcd esp_local_ctrl esp_mm esp_netif esp_netif_stack esp_partition esp_phy esp_pm esp_psram esp_ringbuf esp_rom esp_security esp_system esp_timer esp_vfs_console esp_wifi espcoredump esptool_py fatfs freertos hal heap http_parser idf_test ieee802154 json log lwip main mbedtls mqtt newlib nopnop2002__ssd1306 nvs_flash nvs_sec_provider openthread partition_table protobuf-c protocomm pthread riscv rt sdmmc soc spi_flash spiffs tcp_transport u8g2 u8g2-hal-esp-idf ulp unity usb vfs wear_levelling wifi_provisioning wpa_supplicant
+-- Component paths: /home/thevien257/esp/v5.5.1/esp-idf/components/app_trace /home/thevien257/esp/v5.5.1/esp-idf/components/app_update /home/thevien257/esp/v5.5.1/esp-idf/components/bootloader /home/thevien257/esp/v5.5.1/esp-idf/components/bootloader_support /home/thevien257/esp/v5.5.1/esp-idf/components/bt /home/thevien257/esp/oled_mp3_player/managed_components/chmorgan__esp-libhelix-mp3 /home/thevien257/esp/v5.5.1/esp-idf/components/cmock /home/thevien257/esp/v5.5.1/esp-idf/components/console /home/thevien257/esp/v5.5.1/esp-idf/components/cxx /home/thevien257/esp/v5.5.1/esp-idf/components/driver /home/thevien257/esp/v5.5.1/esp-idf/components/efuse /home/thevien257/esp/v5.5.1/esp-idf/components/esp-tls /home/thevien257/esp/v5.5.1/esp-idf/components/esp_adc /home/thevien257/esp/v5.5.1/esp-idf/components/esp_app_format /home/thevien257/esp/v5.5.1/esp-idf/components/esp_bootloader_format /home/thevien257/esp/v5.5.1/esp-idf/components/esp_coex /home/thevien257/esp/v5.5.1/esp-idf/components/esp_common /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_ana_cmpr /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_bitscrambler /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_cam /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_dac /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_gpio /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_gptimer /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_i2c /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_i2s /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_isp /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_jpeg /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_ledc /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_mcpwm /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_parlio /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_pcnt /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_ppa /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_rmt /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_sdio /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_sdm /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_sdmmc /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_sdspi /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_spi /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_touch_sens /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_tsens /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_twai /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_uart /home/thevien257/esp/v5.5.1/esp-idf/components/esp_driver_usb_serial_jtag /home/thevien257/esp/v5.5.1/esp-idf/components/esp_eth /home/thevien257/esp/v5.5.1/esp-idf/components/esp_event /home/thevien257/esp/v5.5.1/esp-idf/components/esp_gdbstub /home/thevien257/esp/v5.5.1/esp-idf/components/esp_hid /home/thevien257/esp/v5.5.1/esp-idf/components/esp_http_client /home/thevien257/esp/v5.5.1/esp-idf/components/esp_http_server /home/thevien257/esp/v5.5.1/esp-idf/components/esp_https_ota /home/thevien257/esp/v5.5.1/esp-idf/components/esp_https_server /home/thevien257/esp/v5.5.1/esp-idf/components/esp_hw_support /home/thevien257/esp/v5.5.1/esp-idf/components/esp_lcd /home/thevien257/esp/v5.5.1/esp-idf/components/esp_local_ctrl /home/thevien257/esp/v5.5.1/esp-idf/components/esp_mm /home/thevien257/esp/v5.5.1/esp-idf/components/esp_netif /home/thevien257/esp/v5.5.1/esp-idf/components/esp_netif_stack /home/thevien257/esp/v5.5.1/esp-idf/components/esp_partition /home/thevien257/esp/v5.5.1/esp-idf/components/esp_phy /home/thevien257/esp/v5.5.1/esp-idf/components/esp_pm /home/thevien257/esp/v5.5.1/esp-idf/components/esp_psram /home/thevien257/esp/v5.5.1/esp-idf/components/esp_ringbuf /home/thevien257/esp/v5.5.1/esp-idf/components/esp_rom /home/thevien257/esp/v5.5.1/esp-idf/components/esp_security /home/thevien257/esp/v5.5.1/esp-idf/components/esp_system /home/thevien257/esp/v5.5.1/esp-idf/components/esp_timer /home/thevien257/esp/v5.5.1/esp-idf/components/esp_vfs_console /home/thevien257/esp/v5.5.1/esp-idf/components/esp_wifi /home/thevien257/esp/v5.5.1/esp-idf/components/espcoredump /home/thevien257/esp/v5.5.1/esp-idf/components/esptool_py /home/thevien257/esp/v5.5.1/esp-idf/components/fatfs /home/thevien257/esp/v5.5.1/esp-idf/components/freertos /home/thevien257/esp/v5.5.1/esp-idf/components/hal /home/thevien257/esp/v5.5.1/esp-idf/components/heap /home/thevien257/esp/v5.5.1/esp-idf/components/http_parser /home/thevien257/esp/v5.5.1/esp-idf/components/idf_test /home/thevien257/esp/v5.5.1/esp-idf/components/ieee802154 /home/thevien257/esp/v5.5.1/esp-idf/components/json /home/thevien257/esp/v5.5.1/esp-idf/components/log /home/thevien257/esp/v5.5.1/esp-idf/components/lwip /home/thevien257/esp/oled_mp3_player/main /home/thevien257/esp/v5.5.1/esp-idf/components/mbedtls /home/thevien257/esp/v5.5.1/esp-idf/components/mqtt /home/thevien257/esp/v5.5.1/esp-idf/components/newlib /home/thevien257/esp/oled_mp3_player/managed_components/nopnop2002__ssd1306 /home/thevien257/esp/v5.5.1/esp-idf/components/nvs_flash /home/thevien257/esp/v5.5.1/esp-idf/components/nvs_sec_provider /home/thevien257/esp/v5.5.1/esp-idf/components/openthread /home/thevien257/esp/v5.5.1/esp-idf/components/partition_table /home/thevien257/esp/v5.5.1/esp-idf/components/protobuf-c /home/thevien257/esp/v5.5.1/esp-idf/components/protocomm /home/thevien257/esp/v5.5.1/esp-idf/components/pthread /home/thevien257/esp/v5.5.1/esp-idf/components/riscv /home/thevien257/esp/v5.5.1/esp-idf/components/rt /home/thevien257/esp/v5.5.1/esp-idf/components/sdmmc /home/thevien257/esp/v5.5.1/esp-idf/components/soc /home/thevien257/esp/v5.5.1/esp-idf/components/spi_flash /home/thevien257/esp/v5.5.1/esp-idf/components/spiffs /home/thevien257/esp/v5.5.1/esp-idf/components/tcp_transport /home/thevien257/esp/oled_mp3_player/components/u8g2 /home/thevien257/esp/oled_mp3_player/components/u8g2-hal-esp-idf /home/thevien257/esp/v5.5.1/esp-idf/components/ulp /home/thevien257/esp/v5.5.1/esp-idf/components/unity /home/thevien257/esp/v5.5.1/esp-idf/components/usb /home/thevien257/esp/v5.5.1/esp-idf/components/vfs /home/thevien257/esp/v5.5.1/esp-idf/components/wear_levelling /home/thevien257/esp/v5.5.1/esp-idf/components/wifi_provisioning /home/thevien257/esp/v5.5.1/esp-idf/components/wpa_supplicant
+-- Configuring done (7.0s)
+-- Generating done (0.7s)
+-- Build files have been written to: /home/thevien257/esp/oled_mp3_player/build
