@@ -1,9 +1,3 @@
-# idf_component_register(
-#     SRCS "main.c"
-#     INCLUDE_DIRS "."
-#     REQUIRES u8g2 u8g2-hal-esp-idf driver
-# )
-
 idf_component_register(SRCS "main.c"
                     INCLUDE_DIRS "."
                     EMBED_FILES "upload.html"
@@ -18,4 +12,5 @@ idf_component_register(SRCS "main.c"
                              esp_netif
                              esp_http_server
                              nvs_flash
-                             esp_event)
+                             esp_event
+                             lwip)

@@ -848,6 +848,13 @@
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/chmorgan__esp-libhelix-mp3/CMakeFiles/install.dir
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/chmorgan__esp-libhelix-mp3/CMakeFiles/install/local.dir
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/chmorgan__esp-libhelix-mp3/CMakeFiles/install/strip.dir
+/home/thevien257/esp/oled_mp3_player/build/esp-idf/78__esp-opus/CMakeFiles/__idf_78__esp-opus.dir
+/home/thevien257/esp/oled_mp3_player/build/esp-idf/78__esp-opus/CMakeFiles/edit_cache.dir
+/home/thevien257/esp/oled_mp3_player/build/esp-idf/78__esp-opus/CMakeFiles/rebuild_cache.dir
+/home/thevien257/esp/oled_mp3_player/build/esp-idf/78__esp-opus/CMakeFiles/list_install_components.dir
+/home/thevien257/esp/oled_mp3_player/build/esp-idf/78__esp-opus/CMakeFiles/install.dir
+/home/thevien257/esp/oled_mp3_player/build/esp-idf/78__esp-opus/CMakeFiles/install/local.dir
+/home/thevien257/esp/oled_mp3_player/build/esp-idf/78__esp-opus/CMakeFiles/install/strip.dir
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/nopnop2002__ssd1306/CMakeFiles/__idf_nopnop2002__ssd1306.dir
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/nopnop2002__ssd1306/CMakeFiles/edit_cache.dir
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/nopnop2002__ssd1306/CMakeFiles/rebuild_cache.dir

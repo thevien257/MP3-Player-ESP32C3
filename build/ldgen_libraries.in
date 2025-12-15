@@ -153,9 +153,11 @@ $<TARGET_FILE:idf::u8g2>
 $<TARGET_FILE:idf::u8g2-hal-esp-idf>
 $<TARGET_FILE:__idf_u8g2>
 $<TARGET_FILE:idf::chmorgan__esp-libhelix-mp3>
+$<TARGET_FILE:idf::78__esp-opus>
 $<TARGET_FILE:idf::nopnop2002__ssd1306>
 $<TARGET_FILE:idf::main>
 $<TARGET_FILE:__idf_fatfs>
 $<TARGET_FILE:__idf_u8g2-hal-esp-idf>
 $<TARGET_FILE:__idf_chmorgan__esp-libhelix-mp3>
+$<TARGET_FILE:__idf_78__esp-opus>
 $<TARGET_FILE:__idf_nopnop2002__ssd1306>

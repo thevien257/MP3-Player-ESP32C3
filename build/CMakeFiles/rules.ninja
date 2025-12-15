@@ -1753,6 +1753,25 @@ rule C_STATIC_LIBRARY_LINKER____idf_chmorgan__esp-libhelix-mp3_
 #############################################
 # Rule for compiling C files.
 
+rule C_COMPILER____idf_78__esp-opus_unscanned_
+  depfile = $DEP_FILE
+  deps = gcc
+  command = ${LAUNCHER}${CODE_CHECK}/home/thevien257/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20241119/riscv32-esp-elf/bin/riscv32-esp-elf-gcc $DEFINES $INCLUDES $FLAGS -MD -MT $out -MF $DEP_FILE -o $out -c $in
+  description = Building C object $out
+
+
+#############################################
+# Rule for linking C static library.
+
+rule C_STATIC_LIBRARY_LINKER____idf_78__esp-opus_
+  command = $PRE_LINK && /home/thevien257/.espressif/tools/cmake/3.30.2/bin/cmake -E rm -f $TARGET_FILE && /home/thevien257/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20241119/riscv32-esp-elf/bin/riscv32-esp-elf-ar qc $TARGET_FILE $LINK_FLAGS $in && /home/thevien257/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20241119/riscv32-esp-elf/bin/riscv32-esp-elf-ranlib $TARGET_FILE && $POST_BUILD
+  description = Linking C static library $TARGET_FILE
+  restat = $RESTAT
+
+
+#############################################
+# Rule for compiling C files.
+
 rule C_COMPILER____idf_nopnop2002__ssd1306_unscanned_
   depfile = $DEP_FILE
   deps = gcc

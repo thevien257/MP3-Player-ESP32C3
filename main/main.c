@@ -31,6 +31,10 @@
 #include "esp_wifi_types.h"
 #include "nvs.h"
 
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include <opus.h>
+
 // Add these as global variables
 static sdmmc_host_t global_host;
 static sdspi_device_config_t global_slot_config;
@@ -61,6 +65,13 @@ static const char *TAG = "MP3_PLAYER";
 #define WIFI_SSID "Ha Tinh"
 #define WIFI_PASS "98764321"
 
+// Add these defines near WiFi configuration
+#define STREAM_RTP_PORT 5004
+#define OPUS_SAMPLE_RATE 48000
+#define OPUS_CHANNELS 2
+#define OPUS_FRAME_SIZE 960
+#define MAX_RTP_PACKET_SIZE 1500
+
 // === CRITICAL OPTIMIZATION: Increase buffer to 64KB ===
 // #define UPLOAD_BUFFER_SIZE (4 * 1024)
 // #define RECEIVE_BUFFER_SIZE (4 * 1024)
@@ -82,6 +93,18 @@ char stored_ssid[MAX_SSID_LEN] = "";
 char stored_password[MAX_PASS_LEN] = "";
 bool wifi_config_mode = false;
 httpd_handle_t config_server = NULL;
+
+// Add these global variables
+static OpusDecoder *opus_decoder = NULL;
+static bool is_streaming = false;
+static int streaming_socket = -1;
+TaskHandle_t streamTaskHandle = NULL;
+
+// Add global flags for task cleanup coordination
+static bool wifi_server_should_stop = false;
+static SemaphoreHandle_t wifi_cleanup_sem = NULL;
+static bool stream_should_stop = false;
+static SemaphoreHandle_t stream_cleanup_sem = NULL;
 
 // === STATIC BUFFERS - Tránh fragmentation ===
 uint8_t *input_buffer = NULL;       // Allocated only during playback
@@ -142,7 +165,7 @@ typedef enum
 
 MenuMode currentMode = MODE_PLAYING;
 int menuSelection = 0;
-const int menuItems = 7;
+const int menuItems = 8;
 
 typedef enum
 {
@@ -167,6 +190,8 @@ volatile int nextTrackIndex = 0;
 int waveformPhase = 0;
 int volumeAnimCurrent = 5;
 int volumeAnimTarget = 5;
+// Add after volumeAnimCurrent/volumeAnimTarget declarations
+int streamingVolume = 30; // Separate volume for streaming (0-100)
 
 // Current track info
 char currentTrackName[400] = "Unknown";
@@ -207,6 +232,503 @@ static httpd_handle_t start_webserver(void);                   // Added
 bool add_to_playlist(const char *filepath, const char *displayname);
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data);
+
+inline void apply_volume_fast(int16_t *samples, size_t count);
+void wifi_init_sta_stored(void);
+void streaming_task(void *pvParameters);
+bool start_streaming_mode(void);
+void stop_streaming_mode(void);
+void show_streaming_screen(void);
+
+void streaming_task(void *pvParameters)
+{
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(STREAM_RTP_PORT);
+
+    streaming_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (streaming_socket < 0)
+    {
+        printf("[Stream] Socket creation failed\n");
+        is_streaming = false;
+        streamTaskHandle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Set socket timeout
+    struct timeval timeout;
+    timeout.tv_sec = 2;
+    timeout.tv_usec = 0;
+    setsockopt(streaming_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    int err = bind(streaming_socket, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    if (err < 0)
+    {
+        printf("[Stream] Bind failed: %d\n", errno);
+        close(streaming_socket);
+        streaming_socket = -1;
+        is_streaming = false;
+        streamTaskHandle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    printf("[Stream] Listening on UDP port %d\n", STREAM_RTP_PORT);
+
+    // CRITICAL: Allocate buffers on heap
+    uint8_t *rtp_packet = (uint8_t *)heap_caps_malloc(MAX_RTP_PACKET_SIZE, MALLOC_CAP_8BIT);
+    int16_t *pcm_buffer = (int16_t *)heap_caps_malloc(OPUS_FRAME_SIZE * OPUS_CHANNELS * sizeof(int16_t), MALLOC_CAP_8BIT);
+
+    if (!rtp_packet || !pcm_buffer)
+    {
+        printf("[Stream] Failed to allocate buffers\n");
+        if (rtp_packet)
+            free(rtp_packet);
+        if (pcm_buffer)
+            free(pcm_buffer);
+        close(streaming_socket);
+        streaming_socket = -1;
+        is_streaming = false;
+        streamTaskHandle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct sockaddr_in source_addr;
+    socklen_t socklen = sizeof(source_addr);
+
+    // Configure I2S for 48kHz
+    i2s_channel_disable(tx_handle);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(OPUS_SAMPLE_RATE);
+    i2s_channel_reconfig_std_clock(tx_handle, &clk_cfg);
+
+    i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+    i2s_channel_reconfig_std_slot(tx_handle, &slot_cfg);
+    i2s_channel_enable(tx_handle);
+
+    printf("[Stream] I2S configured for 48kHz streaming\n");
+
+    uint32_t last_heap_print = 0;
+    uint32_t packet_count = 0;
+    uint32_t decode_errors = 0;
+    uint32_t i2s_errors = 0;
+    uint32_t last_cleanup = 0;
+
+    while (is_streaming)
+    {
+        // Clear RTP buffer before receive to prevent memory buildup
+        memset(rtp_packet, 0, MAX_RTP_PACKET_SIZE);
+
+        int len = recvfrom(streaming_socket, rtp_packet, MAX_RTP_PACKET_SIZE,
+                           0, (struct sockaddr *)&source_addr, &socklen);
+
+        if (len < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                // Timeout - yield to allow cleanup
+                vTaskDelay(pdMS_TO_TICKS(1));
+                continue;
+            }
+            printf("[Stream] recvfrom error: %d\n", errno);
+            break;
+        }
+
+        if (len > 12)
+        {
+            uint8_t *opus_data = rtp_packet + 12;
+            int opus_len = len - 12;
+
+            // Clear PCM buffer before decode
+            memset(pcm_buffer, 0, OPUS_FRAME_SIZE * OPUS_CHANNELS * sizeof(int16_t));
+
+            // Decode Opus to PCM
+            int frame_count = opus_decode(opus_decoder, opus_data, opus_len,
+                                          pcm_buffer, OPUS_FRAME_SIZE, 0);
+
+            if (frame_count > 0)
+            {
+                // Apply volume
+                apply_volume_fast(pcm_buffer, frame_count * OPUS_CHANNELS);
+
+                // Write to I2S
+                size_t bytes_written;
+                size_t bytes_to_write = frame_count * OPUS_CHANNELS * sizeof(int16_t);
+                esp_err_t ret = i2s_channel_write(tx_handle, (uint8_t *)pcm_buffer,
+                                                  bytes_to_write, &bytes_written, pdMS_TO_TICKS(100));
+
+                if (ret != ESP_OK || bytes_written != bytes_to_write)
+                {
+                    i2s_errors++;
+                }
+
+                packet_count++;
+            }
+            else if (frame_count < 0)
+            {
+                decode_errors++;
+            }
+        }
+
+        // AGGRESSIVE MEMORY CLEANUP every 1000 packets
+        if (packet_count > 0 && packet_count % 1000 == 0)
+        {
+            // Simple yield to allow FreeRTOS cleanup
+            vTaskDelay(pdMS_TO_TICKS(10));
+
+            // last_cleanup++;
+
+            // // Every 10000 packets (~4 minutes), do gentle cleanup
+            // if (last_cleanup >= 10)
+            // {
+            //     last_cleanup = 0;
+
+            //     // Longer yield for garbage collection
+            //     vTaskDelay(pdMS_TO_TICKS(50));
+
+            //     // CRITICAL: Reset min heap tracking after cleanup
+            //     uint32_t heap_before = esp_get_free_heap_size();
+            //     heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);  // Reset tracker
+            //     uint32_t new_min = esp_get_minimum_free_heap_size();
+
+            //     printf("[Stream] Cleanup at %lu packets, heap: %lu, new min: %lu\n",
+            //            packet_count, heap_before, new_min);
+            // }
+        }
+
+        // Periodic status report
+        if (++last_heap_print >= 500)
+        {
+            uint32_t free_heap = esp_get_free_heap_size();
+            uint32_t min_heap = esp_get_minimum_free_heap_size();
+            printf("[Stream] Pkts: %lu, Heap: %lu/%lu, Errs: D=%lu I=%lu\n",
+                   packet_count, free_heap, min_heap, decode_errors, i2s_errors);
+            last_heap_print = 0;
+        }
+
+        // Yield every 50 packets to allow WiFi/lwIP processing
+        // if (packet_count % 50 == 0)
+        // {
+        vTaskDelay(pdMS_TO_TICKS(1));
+        // }
+    }
+
+    // === CRITICAL: Cleanup BEFORE calling vTaskDelete ===
+    printf("[Stream] Task cleanup starting...\n");
+
+    // 1. Free allocated buffers
+    if (rtp_packet)
+    {
+        free(rtp_packet);
+        rtp_packet = NULL;
+    }
+    if (pcm_buffer)
+    {
+        free(pcm_buffer);
+        pcm_buffer = NULL;
+    }
+
+    // 2. Close socket
+    if (streaming_socket >= 0)
+    {
+        shutdown(streaming_socket, SHUT_RDWR);
+        close(streaming_socket);
+        streaming_socket = -1;
+    }
+
+    // 3. Restore I2S
+    i2s_channel_disable(tx_handle);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    i2s_std_clk_config_t clk_cfg_reset = I2S_STD_CLK_DEFAULT_CONFIG(44100);
+    i2s_channel_reconfig_std_clock(tx_handle, &clk_cfg_reset);
+    i2s_channel_enable(tx_handle);
+
+    printf("[Stream] Task cleanup complete. Heap: %lu bytes\n", esp_get_free_heap_size());
+
+    // 4. Signal that cleanup is done
+    xSemaphoreGive(stream_cleanup_sem);
+
+    // 5. Invalidate handle BEFORE deleting self
+    streamTaskHandle = NULL;
+
+    // 6. Delete self - idle task will free stack later
+    vTaskDelete(NULL);
+}
+
+bool start_streaming_mode(void)
+{
+    if (is_streaming)
+    {
+        printf("[Stream] Already streaming\n");
+        return true;
+    }
+
+    // Ensure previous task is cleaned up
+    if (streamTaskHandle != NULL)
+    {
+        printf("[Stream] WARNING: Previous task exists, cleaning up...\n");
+        stop_streaming_mode();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    // Stop playback
+    if (isPlaying || isPlayerActive)
+    {
+        show_loading_screen("Stopping Audio...");
+        stopPlayback = true;
+        isPlaying = false;
+        isPaused = false;
+        int timeout = 0;
+        while (isPlayerActive && timeout < 50)
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            timeout++;
+        }
+    }
+
+    // === CRITICAL FIX: Check largest free block, not total heap ===
+    uint32_t free_heap = esp_get_free_heap_size();
+    size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+
+    printf("[Stream] Free heap: %lu, Largest block: %u\n", free_heap, largest_block);
+
+    // Need at least 30KB contiguous for 12KB stack + Opus decoder + buffers
+    if (largest_block < 30000)
+    {
+        printf("[Stream] ERROR: Largest block %u < 30KB (fragmented heap)\n", largest_block);
+        show_error_screen("Memory Fragmented", "Reboot Required");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return false;
+    }
+
+    show_loading_screen("Init Opus Decoder...");
+
+    // Initialize Opus
+    int err;
+    opus_decoder = opus_decoder_create(OPUS_SAMPLE_RATE, OPUS_CHANNELS, &err);
+    if (err != OPUS_OK || !opus_decoder)
+    {
+        printf("[Stream] Opus decoder init failed: %d\n", err);
+        show_error_screen("Opus Init Fail", "Codec Error");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return false;
+    }
+
+    printf("[Stream] Opus decoder initialized\n");
+
+    show_loading_screen("Starting WiFi...");
+
+    // Initialize WiFi
+    if (!isWifiInitialized)
+    {
+        wifi_init_sta_stored();
+        isWifiInitialized = true;
+    }
+    else
+    {
+        esp_wifi_start();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    // Wait for WiFi
+    int wifi_wait = 0;
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip_info;
+
+    while (wifi_wait < 30)
+    {
+        if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0)
+        {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+        wifi_wait++;
+
+        if (wifi_wait % 5 == 0)
+        {
+            printf("[Stream] Waiting for WiFi... (%d/30)\n", wifi_wait);
+        }
+    }
+
+    if (!netif || ip_info.ip.addr == 0)
+    {
+        show_error_screen("WiFi Failed", "No Connection");
+        opus_decoder_destroy(opus_decoder);
+        opus_decoder = NULL;
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return false;
+    }
+
+    char ip_str[20];
+    snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+    printf("[Stream] Connected! IP: %s\n", ip_str);
+
+    // Reset min heap tracking
+    heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+    printf("[Stream] Memory baseline: %lu bytes\n", esp_get_free_heap_size());
+
+    is_streaming = true;
+
+    // === REDUCED STACK SIZE: 12KB instead of 16KB ===
+    BaseType_t task_created = xTaskCreate(
+        streaming_task,
+        "stream_task",
+        12288, // 12KB stack
+        NULL,
+        5,
+        &streamTaskHandle);
+
+    if (task_created != pdPASS)
+    {
+        printf("[Stream] ERROR: Failed to create task! Heap: %lu, Largest: %u\n",
+               esp_get_free_heap_size(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        is_streaming = false;
+        opus_decoder_destroy(opus_decoder);
+        opus_decoder = NULL;
+        show_error_screen("Task Failed", "Memory Fragmented");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    printf("[Stream] Streaming mode started\n");
+    return true;
+}
+
+void stop_streaming_mode(void)
+{
+    if (!is_streaming && streamTaskHandle == NULL)
+    {
+        return;
+    }
+
+    show_loading_screen("Stopping Stream...");
+
+    // 1. Signal task to stop
+    is_streaming = false;
+    printf("[Stream] Stop signal sent\n");
+
+    // 2. Wait for task to finish cleanup (with timeout)
+    if (xSemaphoreTake(stream_cleanup_sem, pdMS_TO_TICKS(5000)) == pdTRUE)
+    {
+        printf("[Stream] Task cleaned up gracefully\n");
+    }
+    else
+    {
+        printf("[Stream] WARNING: Task cleanup timeout\n");
+        // Force cleanup if needed
+        if (streaming_socket >= 0)
+        {
+            close(streaming_socket);
+            streaming_socket = -1;
+        }
+    }
+
+    // 3. Give idle task time to free task stack
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // 4. Cleanup Opus (if task didn't do it)
+    if (opus_decoder)
+    {
+        opus_decoder_destroy(opus_decoder);
+        opus_decoder = NULL;
+    }
+
+    // 5. Reset WiFi to clear buffers
+    printf("[Stream] Resetting WiFi...\n");
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // 6. Restart WiFi for next use
+    esp_wifi_start();
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    printf("[Stream] Cleanup complete. Heap: %lu bytes\n", esp_get_free_heap_size());
+}
+
+// Add function to show streaming info screen
+void show_streaming_screen(void)
+{
+    u8g2_ClearBuffer(&u8g2);
+
+    // Header
+    u8g2_SetDrawColor(&u8g2, 1);
+    u8g2_DrawBox(&u8g2, 0, 0, 128, 12);
+    u8g2_SetDrawColor(&u8g2, 0);
+    u8g2_SetFont(&u8g2, u8g2_font_helvB08_tr);
+    const char *headerText = "YouTube Stream";
+    int headerWidth = u8g2_GetStrWidth(&u8g2, headerText);
+    u8g2_DrawStr(&u8g2, (128 - headerWidth) / 2, 10, headerText);
+
+    u8g2_SetDrawColor(&u8g2, 1);
+    u8g2_SetFont(&u8g2, u8g2_font_6x10_tr);
+
+    // Get IP address
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip_info;
+
+    if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0)
+    {
+        char ip_str[20];
+        snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+
+        u8g2_DrawStr(&u8g2, 5, 22, "IP:");
+        u8g2_DrawStr(&u8g2, 25, 22, ip_str);
+
+        char port_str[20];
+        snprintf(port_str, sizeof(port_str), "Port: %d", STREAM_RTP_PORT);
+        u8g2_DrawStr(&u8g2, 5, 34, port_str);
+
+        // Volume display
+        u8g2_DrawStr(&u8g2, 5, 46, "Volume:");
+        char vol_str[10];
+        snprintf(vol_str, sizeof(vol_str), "%d%%", streamingVolume);
+        u8g2_DrawStr(&u8g2, 50, 46, vol_str);
+
+        // Volume bar
+        int barX = 5;
+        int barY = 50;
+        int barWidth = 118;
+        int barHeight = 6;
+
+        u8g2_DrawRFrame(&u8g2, barX, barY, barWidth, barHeight, 2);
+        int fillWidth = (streamingVolume * (barWidth - 2)) / 100;
+        if (fillWidth > 0)
+        {
+            u8g2_DrawBox(&u8g2, barX + 1, barY + 1, fillWidth, barHeight - 2);
+        }
+
+        // Animated indicator
+        static int anim_phase = 0;
+        u8g2_SetFont(&u8g2, u8g2_font_5x8_tr);
+        // u8g2_DrawStr(&u8g2, 5, 63, "Listening");
+
+        for (int i = 0; i < 3; i++)
+        {
+            int brightness = abs((anim_phase + i * 10) % 30 - 15);
+            if (brightness > 3)
+            {
+                u8g2_DrawDisc(&u8g2, 100 + i * 8, 60, 2, U8G2_DRAW_ALL);
+            }
+        }
+        anim_phase = (anim_phase + 1) % 30;
+    }
+    else
+    {
+        u8g2_DrawStr(&u8g2, 20, 32, "WiFi not");
+        u8g2_DrawStr(&u8g2, 20, 45, "connected!");
+    }
+
+    u8g2_SendBuffer(&u8g2);
+}
 
 // Add near the top with other helper functions
 static void sync_directory(const char *filepath)
@@ -568,7 +1090,7 @@ void start_wifi_config_mode(void)
 }
 
 // Modified wifi_init_sta to use stored credentials
-static void wifi_init_sta_stored(void)
+void wifi_init_sta_stored(void)
 {
     esp_netif_init();
     esp_event_loop_create_default();
@@ -589,13 +1111,24 @@ static void wifi_init_sta_stored(void)
     strncpy((char *)wifi_config.sta.password, stored_password, sizeof(wifi_config.sta.password));
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
+    // === CRITICAL FIX: Disable beacon monitoring ===
+    wifi_config.sta.listen_interval = 0; // 0 = always awake, never miss beacons
+
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+
+    // === CRITICAL: Completely disable power save ===
     esp_wifi_set_ps(WIFI_PS_NONE);
+
+    // === CRITICAL: Disable beacon timeout (set to max value) ===
+    esp_wifi_set_inactive_time(WIFI_IF_STA, 0xFFFFFFFF); // ~49 days
+
     esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
     esp_wifi_start();
 
     esp_netif_set_default_netif(sta_netif);
+
+    printf("[WiFi] Beacon timeout disabled, power save off\n");
 }
 
 // === Helper: Xóa playlist cũ để giải phóng RAM ===
@@ -680,7 +1213,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
     {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        // ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     }
 }
 
@@ -746,9 +1279,18 @@ static void wifi_init_sta(void)
     };
 
     esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    // NEW: Disable WiFi sleep at a lower level
+    // NEW: Increase beacon timeout tolerance
+    esp_wifi_set_inactive_time(WIFI_IF_STA, 0xFFFFFFFF);
 
     esp_wifi_set_ps(WIFI_PS_NONE);
+
+    // Method 3: Keep WiFi awake with listen interval = 0
+    wifi_config_t current_config;
+    esp_wifi_get_config(WIFI_IF_STA, &current_config);
+    current_config.sta.listen_interval = 0; // 0 = always listen
+    esp_wifi_set_config(WIFI_IF_STA, &current_config);
+
     esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
     esp_wifi_set_max_tx_power(84);
 
@@ -1030,13 +1572,13 @@ void setup_buttons(void)
     gpio_config(&io_conf);
     gpio_isr_handler_add(BTN_DOWN, downISR, NULL);
 
-    // io_conf.pin_bit_mask = (1ULL << BTN_LEFT);
-    // gpio_config(&io_conf);
-    // gpio_isr_handler_add(BTN_LEFT, leftISR, NULL);
+    io_conf.pin_bit_mask = (1ULL << BTN_LEFT);
+    gpio_config(&io_conf);
+    gpio_isr_handler_add(BTN_LEFT, leftISR, NULL);
 
-    // io_conf.pin_bit_mask = (1ULL << BTN_RIGHT);
-    // gpio_config(&io_conf);
-    // gpio_isr_handler_add(BTN_RIGHT, rightISR, NULL);
+    io_conf.pin_bit_mask = (1ULL << BTN_RIGHT);
+    gpio_config(&io_conf);
+    gpio_isr_handler_add(BTN_RIGHT, rightISR, NULL);
 }
 
 bool is_button_pressed(int button_index)
@@ -1418,7 +1960,7 @@ void show_menu_screen(void)
     u8g2_SetFont(&u8g2, u8g2_font_6x10_tr);
 
     const char *items[] = {"Play/Pause", "Stop", "Volume", "Playlist",
-                           "Auto-Play", "WiFi Upload", "WiFi Config"};
+                           "Auto-Play", "WiFi Upload", "WiFi Config", "YT Stream"};
 
     // Show only 5 items at a time with scrolling
     int startIdx = (menuSelection > 2) ? menuSelection - 2 : 0;
@@ -1528,6 +2070,8 @@ bool start_wifi_mode(void)
     printf("SUCCESS: WiFi buffers allocated\n");
     printf("Free heap AFTER alloc: %lu bytes\n", esp_get_free_heap_size());
 
+    wifi_server_should_stop = false;
+
     // 4. Initialize WiFi Stack (Only once per boot)
     if (!isWifiInitialized)
     {
@@ -1554,18 +2098,25 @@ bool start_wifi_mode(void)
 // === Stop WiFi Mode (Free WiFi RAM -> Alloc MP3 RAM) ===
 void stop_wifi_mode(void)
 {
-    // 1. Stop Web Server
+    show_loading_screen("Stopping WiFi...");
+
+    // 1. Signal server to stop gracefully
     if (server)
     {
         httpd_stop(server);
         server = NULL;
     }
 
-    // 2. Stop WiFi to save internal RAM
-    esp_wifi_disconnect();
-    esp_wifi_stop();
+    // 2. Give idle task time to clean up
+    vTaskDelay(pdMS_TO_TICKS(200));
 
-    // 3. Free WiFi Buffers
+    // 3. Stop WiFi
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // 4. Free WiFi buffers BEFORE restoring MP3 buffer
     if (upload_buffer_ptr)
     {
         free(upload_buffer_ptr);
@@ -1577,19 +2128,26 @@ void stop_wifi_mode(void)
         receive_buffer_ptr = NULL;
     }
 
-    // 4. Restore MP3 Buffer
+    printf("WiFi stopped. Free heap: %lu bytes\n", esp_get_free_heap_size());
+
+    // 5. Force idle task to run (this is when vTaskDelete cleanup happens)
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // 6. Restore MP3 buffer
     if (input_buffer == NULL)
     {
         input_buffer = (uint8_t *)malloc(MP3_BUF_SIZE_PLAYING);
         if (input_buffer == NULL)
         {
-            printf("CRITICAL: Failed to re-alloc MP3 buffer. System Halted.\n");
-            show_error_screen("Memory Error", "Restart Req");
-            while (1)
-                vTaskDelay(100);
+            printf("Error: Failed to allocate MP3 buffer!\n");
+            show_error_screen("Memory Error", "Restart Required");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            return;
         }
+        printf("MEMORY: Allocated MP3 buffer for playback\n");
     }
-    printf("MEMORY: Restored MP3 Buffer\n");
+
+    printf("MEMORY: Final free heap: %lu bytes\n", esp_get_free_heap_size());
 }
 
 void handle_buttons(void)
@@ -1924,6 +2482,57 @@ void handle_buttons(void)
                 }
                 show_menu_screen();
                 break;
+
+            case 7: // YouTube Stream
+                // Stop any playback first
+                if (isPlaying || isPaused || isPlayerActive)
+                {
+                    show_loading_screen("Stopping Audio...");
+                    stopPlayback = true;
+                    isPlaying = false;
+                    isPaused = false;
+                    int timeout = 0;
+                    while (isPlayerActive && timeout < 50)
+                    {
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        timeout++;
+                    }
+                }
+
+                if (start_streaming_mode())
+                {
+                    while (1)
+                    {
+                        show_streaming_screen();
+
+                        // Handle volume up (UP button)
+                        if (is_button_pressed(2))
+                        {
+                            streamingVolume = (streamingVolume + 5) > 100 ? 100 : (streamingVolume + 5);
+                            printf("[Stream] Volume: %d%%\n", streamingVolume);
+                        }
+
+                        // Handle volume down (DOWN button)
+                        if (is_button_pressed(3))
+                        {
+                            streamingVolume = (streamingVolume - 5) < 0 ? 0 : (streamingVolume - 5);
+                            printf("[Stream] Volume: %d%%\n", streamingVolume);
+                        }
+
+                        // Exit on Menu button press
+                        if (is_button_pressed(0))
+                        {
+                            break;
+                        }
+
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                    }
+
+                    stop_streaming_mode();
+                }
+
+                show_menu_screen();
+                break;
             }
         }
         else if (currentMode == MODE_PLAYLIST)
@@ -2137,14 +2746,13 @@ void init_i2s()
 void init_sd()
 {
     show_loading_screen("Init SD Card");
-    
+
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = true,  // Enable formatting
+        .format_if_mount_failed = true, // Enable formatting
         .max_files = 5,
         .allocation_unit_size = 64 * 1024,
         .use_one_fat = false,
-        .disk_status_check_enable = false
-    };
+        .disk_status_check_enable = false};
 
     spi_bus_config_t bus_cfg = {
         .mosi_io_num = SD_MOSI,
@@ -2157,7 +2765,7 @@ void init_sd()
     };
 
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
-    
+
     vTaskDelay(pdMS_TO_TICKS(200)); // Longer delay
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
@@ -2170,16 +2778,18 @@ void init_sd()
     slot_config.host_id = host.slot;
 
     sdmmc_card_t *card = NULL;
-    
+
     esp_err_t ret = ESP_FAIL;
     ret = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot_config, &mount_config, &card);
-    
-    if (ret != ESP_OK) {
+
+    if (ret != ESP_OK)
+    {
         printf("\n===========================================\n");
         printf("SD Card Mount Failed - Error 0x%x\n", ret);
         printf("===========================================\n");
-        
-        if (ret == ESP_ERR_NOT_SUPPORTED) {
+
+        if (ret == ESP_ERR_NOT_SUPPORTED)
+        {
             printf("Your SD card does not support SDIO commands.\n");
             printf("\nPossible Solutions:\n");
             printf("1. Use a different SD card (SanDisk/Samsung)\n");
@@ -2190,13 +2800,16 @@ void init_sd()
             printf("   - CLK  (GPIO %d)\n", SD_CLK);
             printf("   - CS   (GPIO %d)\n", SD_CS);
             printf("4. Try reformatting the card on PC (FAT32)\n");
-            
+
             show_error_screen("Incompatible Card", "Use Modern SD");
-        } else {
+        }
+        else
+        {
             show_error_screen("SD Mount Fail", "Check Wiring");
         }
-        
-        while (1) vTaskDelay(100);
+
+        while (1)
+            vTaskDelay(100);
     }
 
     printf("\n===========================================\n");
@@ -2215,24 +2828,23 @@ void init_sd()
 void remount_sd_card(void)
 {
     printf("Remounting SD card to refresh FAT cache...\n");
-    
+
     // Unmount
     esp_vfs_fat_sdcard_unmount(MOUNT_POINT, global_card);
     vTaskDelay(pdMS_TO_TICKS(500));
-    
+
     // Remount
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
         .max_files = 5,
         .allocation_unit_size = 64 * 1024,
         .use_one_fat = false,
-        .disk_status_check_enable = false
-    };
+        .disk_status_check_enable = false};
 
     sdmmc_card_t *card_new;
     esp_err_t ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &global_host,
                                             &global_slot_config, &mount_config, &card_new);
-    
+
     if (ret == ESP_OK)
     {
         global_card = card_new;
@@ -2244,17 +2856,21 @@ void remount_sd_card(void)
     }
 }
 
-static inline void apply_volume_fast(int16_t *samples, size_t count)
+// Replace the existing apply_volume_fast function
+inline void apply_volume_fast(int16_t *samples, size_t count)
 {
+    // Use streamingVolume when in streaming mode, otherwise use volumeAnimCurrent
+    int volume_to_use = is_streaming ? streamingVolume : volumeAnimCurrent;
+
     size_t count4 = count / 4;
     size_t remainder = count % 4;
 
     while (count4--)
     {
-        int32_t s0 = ((int32_t)samples[0] * volumeAnimCurrent) / 100;
-        int32_t s1 = ((int32_t)samples[1] * volumeAnimCurrent) / 100;
-        int32_t s2 = ((int32_t)samples[2] * volumeAnimCurrent) / 100;
-        int32_t s3 = ((int32_t)samples[3] * volumeAnimCurrent) / 100;
+        int32_t s0 = ((int32_t)samples[0] * volume_to_use) / 100;
+        int32_t s1 = ((int32_t)samples[1] * volume_to_use) / 100;
+        int32_t s2 = ((int32_t)samples[2] * volume_to_use) / 100;
+        int32_t s3 = ((int32_t)samples[3] * volume_to_use) / 100;
 
         if (s0 > 32767)
             s0 = 32767;
@@ -2283,7 +2899,7 @@ static inline void apply_volume_fast(int16_t *samples, size_t count)
 
     while (remainder--)
     {
-        int32_t s = ((int32_t)*samples * volumeAnimCurrent) / 100;
+        int32_t s = ((int32_t)*samples * volume_to_use) / 100;
         if (s > 32767)
             s = 32767;
         if (s < -32768)
@@ -2301,31 +2917,31 @@ bool validate_file_clusters(const char *filename)
         printf("Cannot open file for validation\n");
         return false;
     }
-    
+
     // Get file size
     fseek(test_file, 0, SEEK_END);
     long file_size = ftell(test_file);
     fseek(test_file, 0, SEEK_SET);
-    
+
     printf("Validating file: %s (%ld bytes)\n", filename, file_size);
-    
+
     // Try reading at multiple points throughout the file
-    const int test_points = 20;  // ← INCREASED from 10 to 20 for better coverage
+    const int test_points = 20; // ← INCREASED from 10 to 20 for better coverage
     uint8_t test_buffer[512];
     bool all_ok = true;
-    
+
     for (int i = 0; i < test_points; i++)
     {
         // Test at 0%, 5%, 10%, ..., 95%
         long test_position = (file_size / test_points) * i;
-        
+
         if (fseek(test_file, test_position, SEEK_SET) != 0)
         {
             printf("  FAIL at position %ld (seek error)\n", test_position);
             all_ok = false;
             break;
         }
-        
+
         size_t read_bytes = fread(test_buffer, 1, sizeof(test_buffer), test_file);
         if (read_bytes != sizeof(test_buffer) && i < test_points - 1)
         {
@@ -2333,11 +2949,11 @@ bool validate_file_clusters(const char *filename)
             all_ok = false;
             break;
         }
-        
+
         printf("  OK at %ld (%d%%)\n", test_position, (i * 100) / test_points);
         vTaskDelay(pdMS_TO_TICKS(10)); // Small delay between seeks
     }
-    
+
     // === ADD: Explicitly test the last 1KB of the file ===
     if (all_ok && file_size > 1024)
     {
@@ -2361,7 +2977,7 @@ bool validate_file_clusters(const char *filename)
             }
         }
     }
-    
+
     fclose(test_file);
     printf("Validation %s\n", all_ok ? "PASSED" : "FAILED");
     return all_ok;
@@ -2924,27 +3540,27 @@ static esp_err_t upload_handler(httpd_req_t *req)
         // 4. CRITICAL: Unmount and remount to force filesystem consistency
         printf("Forcing filesystem sync...\n");
 
-        // Unmount the SD card
-        esp_vfs_fat_sdcard_unmount(MOUNT_POINT, global_card);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        // // Unmount the SD card
+        // esp_vfs_fat_sdcard_unmount(MOUNT_POINT, global_card);
+        // vTaskDelay(pdMS_TO_TICKS(500));
 
-        // Remount the SD card
-        esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-            .format_if_mount_failed = false,
-            .max_files = 5,
-            .allocation_unit_size = 64 * 1024,
-        };
+        // // Remount the SD card
+        // esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        //     .format_if_mount_failed = false,
+        //     .max_files = 5,
+        //     .allocation_unit_size = 64 * 1024,
+        // };
 
-        sdmmc_card_t *card_new;
-        esp_err_t mount_ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &global_host,
-                                                      &global_slot_config, &mount_config, &card_new);
+        // sdmmc_card_t *card_new;
+        // esp_err_t mount_ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &global_host,
+        //                                               &global_slot_config, &mount_config, &card_new);
 
-        if (mount_ret != ESP_OK)
-        {
-            printf("Failed to remount SD card!\n");
-        }
+        // if (mount_ret != ESP_OK)
+        // {
+        //     printf("Failed to remount SD card!\n");
+        // }
 
-        vTaskDelay(pdMS_TO_TICKS(200));
+        // vTaskDelay(pdMS_TO_TICKS(200));
 
         printf("File write completed and synced: %s (%zu bytes)\n", filepath, total_received);
     }
@@ -3212,6 +3828,10 @@ void app_main(void)
 
     show_loading_screen("Init SD Card");
     init_sd();
+
+    // Create semaphores for task coordination
+    wifi_cleanup_sem = xSemaphoreCreateBinary();
+    stream_cleanup_sem = xSemaphoreCreateBinary();
 
     // === NOTE: WiFi is NOT initialized here anymore. ===
     // It is initialized on-demand in handle_buttons case 5.

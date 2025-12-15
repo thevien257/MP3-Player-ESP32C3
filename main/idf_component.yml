@@ -3,3 +3,4 @@ dependencies:
     path: components/ssd1306/
     git: https://github.com/nopnop2002/esp-idf-ssd1306.git
   chmorgan/esp-libhelix-mp3: '*'
+  78/esp-opus: "^1.0.4"
