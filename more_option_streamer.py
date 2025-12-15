@@ -2,24 +2,31 @@
 import time
 import subprocess
 import threading
-import signal
 import os
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib
 from flask import Flask, render_template_string, request, jsonify
+
+# Initialize GStreamer
+Gst.init(None)
 
 app = Flask(__name__)
 
 # --- Global State ---
 playlist = []
-current_process = None       # GStreamer process
+current_pipeline = None       # GStreamer Pipeline object
 current_fetch_process = None # yt-dlp process
 current_song = None
 is_paused = False
 is_fetching = False          
 is_buffering = False         
 current_index = 0
-manual_switch = False        # Cờ báo hiệu người dùng chọn bài thủ công
+manual_switch = False        
 esp32_ip = "10.62.65.36"
-FIXED_VOLUME = 0.3           # [NEW] Volume cố định 30%
+FIXED_VOLUME = 0.3           
+gst_mainloop = None
+gst_mainloop_thread = None
 
 # [DOWNLOAD STATE]
 download_status = "Idle"
@@ -28,6 +35,15 @@ download_filename = ""
 
 if not os.path.exists('downloads'):
     os.makedirs('downloads')
+
+# Start GLib MainLoop for GStreamer bus messages
+def run_gst_mainloop():
+    global gst_mainloop
+    gst_mainloop = GLib.MainLoop()
+    gst_mainloop.run()
+
+gst_mainloop_thread = threading.Thread(target=run_gst_mainloop, daemon=True)
+gst_mainloop_thread.start()
 
 # --- HTML UI ---
 HTML = """
@@ -219,7 +235,7 @@ def status():
 
     return jsonify({
         "current_display_title": display_title,
-        "is_playing": current_process is not None,
+        "is_playing": current_pipeline is not None,
         "is_paused": is_paused,
         "is_fetching": is_fetching,
         "is_buffering": is_buffering,
@@ -241,27 +257,40 @@ def add_route():
 
 @app.route('/control/<action>', methods=['POST'])
 def control_route(action):
-    global current_process, is_paused, playlist, current_song, current_index, manual_switch
+    global current_pipeline, is_paused, playlist, current_song, current_index, manual_switch
     
     if action == 'stop':
         playlist = []
         current_song = None
         current_index = 0
-        kill_current_process()
+        kill_current_pipeline()
         
     elif action == 'next':
         if len(playlist) > 0:
             manual_switch = True 
             current_index = (current_index + 1) % len(playlist)
-            kill_current_process() 
+            kill_current_pipeline() 
+    
     elif action == 'pause':
-        if current_process and not is_paused:
-            current_process.send_signal(signal.SIGSTOP) 
-            is_paused = True
+        if current_pipeline and not is_paused:
+            # Properly pause the GStreamer pipeline
+            ret = current_pipeline.set_state(Gst.State.PAUSED)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                print("[!] Failed to pause pipeline")
+            else:
+                is_paused = True
+                print("[*] Pipeline paused")
+    
     elif action == 'resume':
-        if current_process and is_paused:
-            current_process.send_signal(signal.SIGCONT) 
-            is_paused = False
+        if current_pipeline and is_paused:
+            # Properly resume the GStreamer pipeline
+            ret = current_pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                print("[!] Failed to resume pipeline")
+            else:
+                is_paused = False
+                print("[*] Pipeline resumed")
+    
     return jsonify({"status": "ok"})
 
 @app.route('/play_index', methods=['POST'])
@@ -271,7 +300,7 @@ def play_index():
     if 0 <= idx < len(playlist):
         manual_switch = True 
         current_index = idx 
-        kill_current_process()
+        kill_current_pipeline()
     return jsonify({"status": "ok"})
 
 @app.route('/download_index', methods=['POST'])
@@ -285,18 +314,21 @@ def download_index_route():
 
 # --- Helper Functions ---
 
-def kill_current_process():
-    global current_process, current_fetch_process, is_paused, is_buffering
+def kill_current_pipeline():
+    global current_pipeline, current_fetch_process, is_paused, is_buffering
     
     is_buffering = False
+    is_paused = False
     
-    if current_process:
+    if current_pipeline:
         try:
-            current_process.terminate()
-            current_process.wait(timeout=1)
-        except:
-            pass
-        current_process = None
+            # Stop the pipeline gracefully
+            current_pipeline.set_state(Gst.State.NULL)
+            current_pipeline = None
+            print("[*] Pipeline stopped")
+        except Exception as e:
+            print(f"[!] Error stopping pipeline: {e}")
+            current_pipeline = None
 
     if current_fetch_process:
         print("[!] Killing yt-dlp fetch process...")
@@ -304,10 +336,11 @@ def kill_current_process():
             current_fetch_process.terminate()
             current_fetch_process.wait(timeout=1)
         except:
-            pass
+            try:
+                current_fetch_process.kill()
+            except:
+                pass
         current_fetch_process = None
-        
-    is_paused = False
 
 def fetch_metadata_and_add(url):
     global is_fetching
@@ -315,7 +348,7 @@ def fetch_metadata_and_add(url):
     print(f"[*] Fetching info for: {url}")
     cmd = ["yt-dlp", "--flat-playlist", "--print", "%(title)s::%(id)s", url]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         lines = res.stdout.strip().split('\n')
         count = 0
         for line in lines:
@@ -336,7 +369,8 @@ def fetch_metadata_and_add(url):
 def run_download(song_obj):
     global is_downloading, download_status, download_filename
     
-    if is_downloading: return
+    if is_downloading: 
+        return
     
     is_downloading = True
     download_filename = song_obj['title']
@@ -350,10 +384,12 @@ def run_download(song_obj):
     
     print(f"[*] Downloading: {song_obj['title']}")
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, timeout=600)
         download_status = "Completed!"
     except subprocess.CalledProcessError:
         download_status = "Failed!"
+    except subprocess.TimeoutExpired:
+        download_status = "Timeout!"
     except Exception as e:
         download_status = f"Error: {str(e)}"
     finally:
@@ -364,11 +400,12 @@ def run_download(song_obj):
             download_filename = ""
 
 def player_loop():
-    global current_process, current_fetch_process, current_song, is_paused, playlist, current_index, manual_switch, is_buffering
+    global current_pipeline, current_fetch_process, current_song, is_paused, playlist, current_index, manual_switch, is_buffering
     
     while True:
-        if current_process is None and len(playlist) > 0:
-            if current_index >= len(playlist): current_index = 0
+        if current_pipeline is None and len(playlist) > 0:
+            if current_index >= len(playlist): 
+                current_index = 0
             
             current_song = playlist[current_index] 
             print(f"[*] Buffering index {current_index}: {current_song['title']}")
@@ -376,9 +413,14 @@ def player_loop():
             
             try:
                 cmd_url = ["yt-dlp", "-f", "bestaudio", "-g", current_song['url']]
-                current_fetch_process = subprocess.Popen(cmd_url, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                current_fetch_process = subprocess.Popen(
+                    cmd_url, 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE, 
+                    text=True
+                )
                 
-                stdout, stderr = current_fetch_process.communicate()
+                stdout, stderr = current_fetch_process.communicate(timeout=30)
                 
                 if current_fetch_process is None: 
                     print("[!] Fetch aborted via Manual Switch.")
@@ -389,7 +431,9 @@ def player_loop():
                 current_fetch_process = None
 
                 if return_code != 0:
-                    print(f"[!] Failed to get stream.")
+                    print(f"[!] Failed to get stream URL for: {current_song['title']}")
+                    print(f"[!] Error: {stderr[:200]}")
+                    
                     if manual_switch:
                         print("[!] Manual song failed. Retrying...")
                         is_buffering = False
@@ -403,30 +447,50 @@ def player_loop():
                 
                 audio_url = stdout.strip().split('\n')[0]
                 if not audio_url:
+                    print("[!] Empty audio URL received")
+                    is_buffering = False
                     continue
 
-                # --- START PLAYING ---
-                # [MODIFIED] Volume hardcoded to FIXED_VOLUME (0.3)
-                print(f"[*] Starting GStreamer with Volume: {FIXED_VOLUME}")
-                gst_cmd = [
-                    "gst-launch-1.0", "urisourcebin", f"uri={audio_url}", "!",
-                    "decodebin", "!", "audioconvert", "!", "volume", f"volume={FIXED_VOLUME}", "!",
-                    "audioresample", "!", "opusenc", "inband-fec=true", "frame-size=20", 
-                    "bandwidth=mediumband", "!", "rtpopuspay", "pt=96", "!",
-                    "udpsink", f"host={esp32_ip}", "port=5004"
-                ]
+                # --- BUILD GSTREAMER PIPELINE ---
+                print(f"[*] Creating GStreamer pipeline with Volume: {FIXED_VOLUME}")
                 
-                current_process = subprocess.Popen(gst_cmd)
+                pipeline_str = (
+                    f"urisourcebin uri={audio_url} ! "
+                    f"decodebin ! audioconvert ! volume volume={FIXED_VOLUME} ! "
+                    f"audioresample ! opusenc inband-fec=true frame-size=20 bandwidth=mediumband ! "
+                    f"rtpopuspay pt=96 ! udpsink host={esp32_ip} port=5004"
+                )
+                
+                current_pipeline = Gst.parse_launch(pipeline_str)
+                
+                if not current_pipeline:
+                    print("[!] Failed to create pipeline")
+                    is_buffering = False
+                    continue
+                
+                # Set up bus message handler
+                bus = current_pipeline.get_bus()
+                bus.add_signal_watch()
+                bus.connect("message", on_bus_message)
+                
+                # Start playing
+                ret = current_pipeline.set_state(Gst.State.PLAYING)
+                if ret == Gst.StateChangeReturn.FAILURE:
+                    print("[!] Unable to set pipeline to PLAYING")
+                    current_pipeline = None
+                    is_buffering = False
+                    continue
+                
                 is_buffering = False 
                 
                 if manual_switch:
                     manual_switch = False
                 
-                current_process.wait() 
+                # Wait for EOS or error
+                while current_pipeline:
+                    time.sleep(0.5)
                 
-                current_process = None
-                is_paused = False
-                
+                # Clean up after playback ends
                 if len(playlist) == 0:
                     current_index = 0
                     current_song = None
@@ -435,14 +499,42 @@ def player_loop():
                 else:
                     current_index = (current_index + 1) % len(playlist)
                 
+            except subprocess.TimeoutExpired:
+                print(f"[!] Timeout fetching stream URL")
+                if current_fetch_process:
+                    current_fetch_process.kill()
+                    current_fetch_process = None
+                is_buffering = False
+                time.sleep(1)
+                
             except Exception as e:
                 print(f"[!] Playback error: {e}")
-                current_process = None
+                current_pipeline = None
                 current_fetch_process = None
                 is_buffering = False
                 time.sleep(1)
         else:
             time.sleep(0.5)
+
+def on_bus_message(bus, message):
+    global current_pipeline, is_paused
+    
+    t = message.type
+    
+    if t == Gst.MessageType.EOS:
+        print("[*] End of stream")
+        if current_pipeline:
+            current_pipeline.set_state(Gst.State.NULL)
+            current_pipeline = None
+            is_paused = False
+    
+    elif t == Gst.MessageType.ERROR:
+        err, debug = message.parse_error()
+        print(f"[!] Error: {err}, {debug}")
+        if current_pipeline:
+            current_pipeline.set_state(Gst.State.NULL)
+            current_pipeline = None
+            is_paused = False
 
 if __name__ == '__main__':
     threading.Thread(target=player_loop, daemon=True).start()
