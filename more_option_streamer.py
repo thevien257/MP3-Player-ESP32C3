@@ -7,6 +7,25 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
 from flask import Flask, render_template_string, request, jsonify
+import os
+
+# ========== UPDATE THIS BLOCK ==========
+# Force pipx yt-dlp to be used instead of system yt-dlp
+pipx_bin = os.path.expanduser("~/.local/bin")
+deno_bin = os.path.expanduser("~/.deno/bin")  # ← ADD THIS
+# Add both to PATH
+os.environ['PATH'] = f"{pipx_bin}:{deno_bin}:{os.environ['PATH']}"  # ← UPDATE THIS
+
+# Verify paths
+import shutil
+ytdlp_path = shutil.which('yt-dlp')
+deno_path = shutil.which('deno')  # ← ADD THIS
+print(f"[INFO] Using yt-dlp from: {ytdlp_path}")
+print(f"[INFO] Using deno from: {deno_path}")  # ← ADD THIS
+# ==========================================
+
+# At the top
+COOKIES_FILE = os.path.expanduser("~/Downloads/youtube_cookies.txt")
 
 # Initialize GStreamer
 Gst.init(None)
@@ -346,9 +365,9 @@ def fetch_metadata_and_add(url):
     global is_fetching
     is_fetching = True
     print(f"[*] Fetching info for: {url}")
-    cmd = ["yt-dlp", "--flat-playlist", "--print", "%(title)s::%(id)s", url]
+    cmd = [ "/home/thevien257/.local/bin/yt-dlp", "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "--flat-playlist", "--print", "%(title)s::%(id)s", "--cookies", COOKIES_FILE, url ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         lines = res.stdout.strip().split('\n')
         count = 0
         for line in lines:
@@ -376,11 +395,7 @@ def run_download(song_obj):
     download_filename = song_obj['title']
     download_status = "Starting..."
     
-    cmd = [
-        "yt-dlp", "-o", "downloads/%(title)s.%(ext)s", "-f", "bestaudio/best",
-        "-x", "--audio-format", "mp3", "--audio-quality", "0",
-        "--no-playlist", song_obj['url']
-    ]
+    cmd = [ "/home/thevien257/.local/bin/yt-dlp", "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "-o", "downloads/%(title)s.%(ext)s", "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0", "--no-playlist", "--cookies", COOKIES_FILE, song_obj['url'] ]
     
     print(f"[*] Downloading: {song_obj['title']}")
     try:
@@ -412,7 +427,7 @@ def player_loop():
             is_buffering = True 
             
             try:
-                cmd_url = ["yt-dlp", "-f", "bestaudio", "-g", current_song['url']]
+                cmd_url = [ "/home/thevien257/.local/bin/yt-dlp", "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "-f", "bestaudio", "-g", "--cookies", COOKIES_FILE, current_song['url'] ]
                 current_fetch_process = subprocess.Popen(
                     cmd_url, 
                     stdout=subprocess.PIPE, 

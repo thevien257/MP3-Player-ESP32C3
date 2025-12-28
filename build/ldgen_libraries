@@ -37,7 +37,6 @@
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/esp_app_format/libesp_app_format.a
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/esp_bootloader_format/libesp_bootloader_format.a
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/esp_mm/libesp_mm.a
-/home/thevien257/esp/oled_mp3_player/build/esp-idf/esp_pm/libesp_pm.a
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/esp_gdbstub/libesp_gdbstub.a
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/driver/libdriver.a
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/esp_driver_gptimer/libesp_driver_gptimer.a
@@ -69,6 +68,7 @@
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/esp_security/libesp_security.a
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/pthread/libpthread.a
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/esp_driver_gpio/libesp_driver_gpio.a
+/home/thevien257/esp/oled_mp3_player/build/esp-idf/esp_pm/libesp_pm.a
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/esp_app_format/libesp_app_format.a
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/esp_bootloader_format/libesp_bootloader_format.a
 /home/thevien257/esp/oled_mp3_player/build/esp-idf/app_update/libapp_update.a

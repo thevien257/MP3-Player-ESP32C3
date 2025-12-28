@@ -923,10 +923,10 @@ static esp_err_t config_root_handler(httpd_req_t *req)
         "<script>"
         "document.getElementById('wifiForm').onsubmit = function(e) {"
         "  e.preventDefault();"
-        "  var ssid = document.getElementById('ssid').value;"
-        "  var pass = document.getElementById('password').value;"
+        "  var ssid = document.getElementById('ssid').value;" // Get "Ha Tinh"
+        "  var pass = document.getElementById('password').value;" // Get "98764321"
         "  var status = document.getElementById('status');"
-        "  fetch('/save?ssid=' + encodeURIComponent(ssid) + '&password=' + encodeURIComponent(pass))"
+        "  fetch('/save?ssid=' + encodeURIComponent(ssid) + '&password=' + encodeURIComponent(pass))" // http://192.168.4.1/save?ssid=Ha%20Tinh&password=98764321
         "  .then(r => r.text())"
         "  .then(data => {"
         "    status.className = 'status success';"
@@ -962,6 +962,8 @@ static esp_err_t config_root_handler(httpd_req_t *req)
 static esp_err_t config_save_handler(httpd_req_t *req)
 {
     char buf[200];
+    // 1. GET THE ENTIRE QUERY STRING
+    // Gets "ssid=Ha%20Tinh&password=98764321"
     if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) != ESP_OK)
     {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing parameters");
@@ -974,6 +976,8 @@ static esp_err_t config_save_handler(httpd_req_t *req)
     char password[MAX_PASS_LEN] = {0};
 
     // Get encoded values
+    // Extract "Ha%20Tinh" from the query string
+    // Extract "98764321" from the query string
     if (httpd_query_key_value(buf, "ssid", ssid_encoded, sizeof(ssid_encoded)) != ESP_OK ||
         httpd_query_key_value(buf, "password", password_encoded, sizeof(password_encoded)) != ESP_OK)
     {
@@ -993,9 +997,11 @@ static esp_err_t config_save_handler(httpd_req_t *req)
 
     printf("Decoded SSID: %s\n", ssid); // This will now show "Ha Tinh" correctly
 
+    // 4. SAVE TO FLASH MEMORY (NVS)
     esp_err_t err = save_wifi_credentials(ssid, password);
     if (err == ESP_OK)
     {
+        // 5. SEND RESPONSE & RESTART
         httpd_resp_sendstr(req, "OK");
         // Schedule restart after 3 seconds
         vTaskDelay(pdMS_TO_TICKS(3000));
@@ -3098,6 +3104,7 @@ void play_file(const char *filename)
             bytes_in_buffer += bytes_read;
         }
 
+        // Start condition for MP3 frame
         int offset = MP3FindSyncWord(read_ptr, bytes_in_buffer);
         if (offset < 0)
         {
