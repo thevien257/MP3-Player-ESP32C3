@@ -1172,7 +1172,7 @@ void scan_mp3_files(void)
                 // Giới hạn độ dài tên file để tránh tràn bộ nhớ
                 if (name_len < 240)
                 {
-                    char filepath[256];
+                    char filepath[512];
                     snprintf(filepath, sizeof(filepath), "/sdcard/%s", ent->d_name);
 
                     char displayname[128];
@@ -2863,7 +2863,7 @@ void remount_sd_card(void)
 }
 
 // Replace the existing apply_volume_fast function
-inline void apply_volume_fast(int16_t *samples, size_t count)
+static void apply_volume_fast(int16_t *samples, size_t count)
 {
     // Use streamingVolume when in streaming mode, otherwise use volumeAnimCurrent
     int volume_to_use = is_streaming ? streamingVolume : volumeAnimCurrent;

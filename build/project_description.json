@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "oled_mp3_player",
-    "project_version":    "4f304e9-dirty",
+    "project_version":    "67f0b50-dirty",
     "project_path":       "/home/thevien257/esp/oled_mp3_player",
     "idf_path":           "/home/thevien257/esp/v5.5.1/esp-idf",
     "build_dir":          "/home/thevien257/esp/oled_mp3_player/build",

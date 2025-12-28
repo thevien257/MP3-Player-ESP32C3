@@ -355,6 +355,9 @@ PYTHON:UNINITIALIZED=/home/thevien257/.espressif/python_env/idf5.5_py3.12_env/bi
 //No help, variable specified on the command line.
 PYTHON_DEPS_CHECKED:UNINITIALIZED=1
 
+//No help, variable specified on the command line.
+SDKCONFIG:UNINITIALIZED=/home/thevien257/esp/oled_mp3_player/sdkconfig
+
 //Allow unsafe builds. These builds ARE NOT SECURE.
 UNSAFE_BUILD:BOOL=OFF
 
